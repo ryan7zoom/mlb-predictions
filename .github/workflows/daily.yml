@@ -2,12 +2,17 @@ name: Daily MLB Report
 
 on:
   schedule:
-    # 14:00 UTC = 10:00 AM Eastern (adjust if you want a different time)
     - cron: '0 14 * * *'
-  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+  workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -23,11 +28,18 @@ jobs:
       - name: Run prediction script
         run: python predict.py
 
-      - name: Commit and push report
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add docs/
-          git diff --quiet --cached || git commit -m "Daily MLB report update"
-          git push
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
