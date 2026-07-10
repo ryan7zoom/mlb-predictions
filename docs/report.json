@@ -1,0 +1,1006 @@
+[
+  {
+    "matchup": "Philadelphia Phillies @ Detroit Tigers",
+    "pitchers": [
+      {
+        "name": "Aaron Nola",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          5,
+          4,
+          2,
+          5,
+          5,
+          8,
+          4,
+          3,
+          6,
+          5,
+          5,
+          7
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.833,
+          "5": 0.667,
+          "6": 0.25
+        }
+      },
+      {
+        "name": "Jack Flaherty",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          4,
+          4,
+          10,
+          2,
+          4,
+          7,
+          9,
+          6,
+          7,
+          1,
+          9,
+          5
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.833,
+          "5": 0.583,
+          "6": 0.5
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.33,
+        "home_cover_prob": 0.391
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.609,
+        "home_cover_prob": 0.67
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.696,
+        "home_cover_prob": 0.751
+      }
+    ]
+  },
+  {
+    "matchup": "Milwaukee Brewers @ Pittsburgh Pirates",
+    "pitchers": [
+      {
+        "name": "Brandon Sproat",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          5,
+          5,
+          6,
+          5,
+          7,
+          4,
+          2,
+          3,
+          6,
+          10,
+          7,
+          4
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.833,
+          "5": 0.667,
+          "6": 0.417
+        }
+      },
+      {
+        "name": "Braxton Ashcraft",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          6,
+          6,
+          5,
+          9,
+          5,
+          11,
+          5,
+          4,
+          7,
+          10,
+          8,
+          7
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 1.0,
+          "5": 0.917,
+          "6": 0.667
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.464,
+        "home_cover_prob": 0.266
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.734,
+        "home_cover_prob": 0.536
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.806,
+        "home_cover_prob": 0.629
+      }
+    ]
+  },
+  {
+    "matchup": "New York Yankees @ Washington Nationals",
+    "pitchers": [
+      {
+        "name": "Ryan Weathers",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          4,
+          5,
+          9,
+          7,
+          4,
+          10,
+          4,
+          2,
+          8,
+          6,
+          3,
+          6
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.833,
+          "5": 0.583,
+          "6": 0.5
+        }
+      },
+      {
+        "name": "Carson Palmquist",
+        "side": "home",
+        "recent_starts_sampled": 2,
+        "recent_k_values": [
+          3,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.0,
+          "5": 0.0,
+          "6": 0.0
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.432,
+        "home_cover_prob": 0.294
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.706,
+        "home_cover_prob": 0.568
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.782,
+        "home_cover_prob": 0.659
+      }
+    ]
+  },
+  {
+    "matchup": "Kansas City Royals @ Baltimore Orioles",
+    "pitchers": [
+      {
+        "name": "Luinder Avila",
+        "side": "away",
+        "recent_starts_sampled": 8,
+        "recent_k_values": [
+          4,
+          5,
+          3,
+          0,
+          5,
+          6,
+          4,
+          4
+        ],
+        "floor_probabilities": {
+          "3": 0.875,
+          "4": 0.75,
+          "5": 0.375,
+          "6": 0.125
+        }
+      },
+      {
+        "name": "Brandon Young",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          2,
+          5,
+          5,
+          3,
+          4,
+          7,
+          4,
+          5,
+          2,
+          5,
+          8,
+          5
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.75,
+          "5": 0.583,
+          "6": 0.167
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.321,
+        "home_cover_prob": 0.402
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.598,
+        "home_cover_prob": 0.679
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.687,
+        "home_cover_prob": 0.759
+      }
+    ]
+  },
+  {
+    "matchup": "Chicago Cubs @ Cincinnati Reds",
+    "pitchers": [
+      {
+        "name": "Shota Imanaga",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          5,
+          10,
+          6,
+          2,
+          6,
+          2,
+          5,
+          7,
+          3,
+          4,
+          4,
+          8
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.75,
+          "5": 0.583,
+          "6": 0.417
+        }
+      },
+      {
+        "name": "Hunter Greene",
+        "side": "home",
+        "recent_starts_sampled": 1,
+        "recent_k_values": [
+          7
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 1.0,
+          "5": 1.0,
+          "6": 1.0
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.469,
+        "home_cover_prob": 0.263
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.737,
+        "home_cover_prob": 0.531
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.809,
+        "home_cover_prob": 0.624
+      }
+    ]
+  },
+  {
+    "matchup": "Seattle Mariners @ Tampa Bay Rays",
+    "pitchers": [
+      {
+        "name": "Luis Castillo",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          3,
+          3,
+          6,
+          3,
+          5,
+          6,
+          6,
+          6,
+          5,
+          4,
+          4,
+          4
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.75,
+          "5": 0.5,
+          "6": 0.333
+        }
+      },
+      {
+        "name": "Nick Martinez",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          4,
+          4,
+          3,
+          4,
+          1,
+          5,
+          1,
+          2,
+          6,
+          5,
+          3,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 0.75,
+          "4": 0.5,
+          "5": 0.25,
+          "6": 0.083
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.352,
+        "home_cover_prob": 0.369
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.631,
+        "home_cover_prob": 0.648
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.717,
+        "home_cover_prob": 0.732
+      }
+    ]
+  },
+  {
+    "matchup": "Cleveland Guardians @ Miami Marlins",
+    "pitchers": [
+      {
+        "name": "Parker Messick",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          6,
+          7,
+          7,
+          6,
+          6,
+          4,
+          4,
+          4,
+          9,
+          10,
+          5,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.917,
+          "5": 0.667,
+          "6": 0.583
+        }
+      },
+      {
+        "name": "Sandy Alcantara",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          5,
+          3,
+          6,
+          3,
+          4,
+          5,
+          7,
+          7,
+          6,
+          4,
+          3,
+          8
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.75,
+          "5": 0.583,
+          "6": 0.417
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.323,
+        "home_cover_prob": 0.399
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.601,
+        "home_cover_prob": 0.677
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.689,
+        "home_cover_prob": 0.757
+      }
+    ]
+  },
+  {
+    "matchup": "Boston Red Sox @ New York Mets",
+    "pitchers": [
+      {
+        "name": "Sonny Gray",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          2,
+          2,
+          6,
+          9,
+          4,
+          7,
+          3,
+          7,
+          4,
+          11,
+          9,
+          7
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.75,
+          "5": 0.583,
+          "6": 0.583
+        }
+      },
+      {
+        "name": "Nolan McLean",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          6,
+          6,
+          7,
+          5,
+          6,
+          2,
+          5,
+          6,
+          9,
+          9,
+          7,
+          5
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.917,
+          "5": 0.917,
+          "6": 0.667
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.433,
+        "home_cover_prob": 0.293
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.707,
+        "home_cover_prob": 0.567
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.784,
+        "home_cover_prob": 0.658
+      }
+    ]
+  },
+  {
+    "matchup": "Athletics @ Chicago White Sox",
+    "pitchers": [
+      {
+        "name": "Jacob Lopez",
+        "side": "away",
+        "recent_starts_sampled": 10,
+        "recent_k_values": [
+          0,
+          6,
+          5,
+          5,
+          1,
+          5,
+          5,
+          2,
+          2,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 0.6,
+          "4": 0.5,
+          "5": 0.5,
+          "6": 0.1
+        }
+      },
+      {
+        "name": "Sean Burke",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          2,
+          3,
+          8,
+          4,
+          5,
+          5,
+          8,
+          6,
+          6,
+          6,
+          8,
+          11
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.833,
+          "5": 0.75,
+          "6": 0.583
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.272,
+        "home_cover_prob": 0.457
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.543,
+        "home_cover_prob": 0.728
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.636,
+        "home_cover_prob": 0.801
+      }
+    ]
+  },
+  {
+    "matchup": "Houston Astros @ Texas Rangers",
+    "pitchers": [
+      {
+        "name": "Hunter Brown",
+        "side": "away",
+        "recent_starts_sampled": 6,
+        "recent_k_values": [
+          9,
+          8,
+          7,
+          4,
+          4,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.833,
+          "5": 0.5,
+          "6": 0.5
+        }
+      },
+      {
+        "name": "Cal Quantrill",
+        "side": "home",
+        "recent_starts_sampled": 3,
+        "recent_k_values": [
+          1,
+          5,
+          2
+        ],
+        "floor_probabilities": {
+          "3": 0.333,
+          "4": 0.333,
+          "5": 0.333,
+          "6": 0.0
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.329,
+        "home_cover_prob": 0.393
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.607,
+        "home_cover_prob": 0.671
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.695,
+        "home_cover_prob": 0.752
+      }
+    ]
+  },
+  {
+    "matchup": "Los Angeles Angels @ Minnesota Twins",
+    "pitchers": [
+      {
+        "name": "Grayson Rodriguez",
+        "side": "away",
+        "recent_starts_sampled": 6,
+        "recent_k_values": [
+          4,
+          5,
+          5,
+          3,
+          6,
+          1
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.667,
+          "5": 0.5,
+          "6": 0.167
+        }
+      },
+      {
+        "name": "Zebby Matthews",
+        "side": "home",
+        "recent_starts_sampled": 10,
+        "recent_k_values": [
+          5,
+          6,
+          6,
+          7,
+          2,
+          4,
+          4,
+          5,
+          7,
+          5
+        ],
+        "floor_probabilities": {
+          "3": 0.9,
+          "4": 0.9,
+          "5": 0.7,
+          "6": 0.4
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.328,
+        "home_cover_prob": 0.394
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.606,
+        "home_cover_prob": 0.672
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.694,
+        "home_cover_prob": 0.753
+      }
+    ]
+  },
+  {
+    "matchup": "Atlanta Braves @ St. Louis Cardinals",
+    "pitchers": [
+      {
+        "name": "Chris Sale",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          7,
+          9,
+          11,
+          7,
+          8,
+          8,
+          8,
+          6,
+          6,
+          7,
+          10,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 0.917,
+          "5": 0.917,
+          "6": 0.917
+        }
+      },
+      {
+        "name": "Kyle Leahy",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          7,
+          5,
+          5,
+          2,
+          8,
+          4,
+          1,
+          5,
+          7,
+          3,
+          5,
+          6
+        ],
+        "floor_probabilities": {
+          "3": 0.833,
+          "4": 0.75,
+          "5": 0.667,
+          "6": 0.333
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.453,
+        "home_cover_prob": 0.276
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.724,
+        "home_cover_prob": 0.547
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.798,
+        "home_cover_prob": 0.64
+      }
+    ]
+  },
+  {
+    "matchup": "Toronto Blue Jays @ San Diego Padres",
+    "pitchers": [
+      {
+        "name": "Shane Bieber",
+        "side": "away",
+        "recent_starts_sampled": 3,
+        "recent_k_values": [
+          2,
+          4,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 0.667,
+          "4": 0.333,
+          "5": 0.0,
+          "6": 0.0
+        }
+      },
+      {
+        "name": "JP Sears",
+        "side": "home",
+        "recent_starts_sampled": 3,
+        "recent_k_values": [
+          5,
+          4,
+          5
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 1.0,
+          "5": 0.667,
+          "6": 0.0
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.368,
+        "home_cover_prob": 0.353
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.647,
+        "home_cover_prob": 0.632
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.731,
+        "home_cover_prob": 0.717
+      }
+    ]
+  },
+  {
+    "matchup": "Arizona Diamondbacks @ Los Angeles Dodgers",
+    "pitchers": [
+      {
+        "name": "Eduardo Rodriguez",
+        "side": "away",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          7,
+          4,
+          6,
+          4,
+          6,
+          3,
+          5,
+          3,
+          5,
+          5,
+          1,
+          3
+        ],
+        "floor_probabilities": {
+          "3": 0.917,
+          "4": 0.667,
+          "5": 0.5,
+          "6": 0.25
+        }
+      },
+      {
+        "name": "Shohei Ohtani",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          10,
+          7,
+          9,
+          8,
+          8,
+          4,
+          7,
+          6,
+          6,
+          5,
+          8,
+          9
+        ],
+        "floor_probabilities": {
+          "3": 1.0,
+          "4": 1.0,
+          "5": 0.917,
+          "6": 0.833
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.199,
+        "home_cover_prob": 0.552
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.448,
+        "home_cover_prob": 0.801
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.543,
+        "home_cover_prob": 0.86
+      }
+    ]
+  },
+  {
+    "matchup": "Colorado Rockies @ San Francisco Giants",
+    "pitchers": [
+      {
+        "name": "Tanner Gordon",
+        "side": "away",
+        "recent_starts_sampled": 4,
+        "recent_k_values": [
+          3,
+          2,
+          4,
+          7
+        ],
+        "floor_probabilities": {
+          "3": 0.75,
+          "4": 0.5,
+          "5": 0.25,
+          "6": 0.25
+        }
+      },
+      {
+        "name": "Robbie Ray",
+        "side": "home",
+        "recent_starts_sampled": 12,
+        "recent_k_values": [
+          4,
+          5,
+          7,
+          2,
+          1,
+          3,
+          6,
+          4,
+          3,
+          6,
+          2,
+          4
+        ],
+        "floor_probabilities": {
+          "3": 0.75,
+          "4": 0.583,
+          "5": 0.333,
+          "6": 0.25
+        }
+      }
+    ],
+    "spread_lines": [
+      {
+        "spread": -1.5,
+        "away_cover_prob": 0.344,
+        "home_cover_prob": 0.377
+      },
+      {
+        "spread": 1.5,
+        "away_cover_prob": 0.623,
+        "home_cover_prob": 0.656
+      },
+      {
+        "spread": 2.5,
+        "away_cover_prob": 0.709,
+        "home_cover_prob": 0.739
+      }
+    ]
+  }
+]
