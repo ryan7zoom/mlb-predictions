@@ -61,7 +61,7 @@ PARK_FACTORS = {
 # Source note shown in UI. If MLB adds/moves a franchise this table will be stale;
 # it is intentionally static (not scraped) because Baseball Savant does not expose
 # a documented free JSON endpoint for this data - only a web leaderboard.
-PARK_FACTOR_SOURCE = "RotoWire 2026 Park Factors (3yr rolling, pitching), published May 17, 2026"
+PARK_FACTOR_SOURCE = "RotoWire 2026 Park Factors (3yr , pitching), published May 17, 2026"
 
 # ---------- low-level fetch ----------
 
@@ -487,7 +487,7 @@ def render_html(report):
         if park:
             rows.append(f"<p class='sub'>Park: {park['team']} home venue — "
                         f"Runs {park['R']}, HR {park['HR']}, SO {park['SO']} "
-                        f"(100 = neutral, 3yr rolling factor)</p>")
+                        f"(100 = neutral)</p>")
 
         for p in g["pitchers"]:
             side_label = "Away" if p["side"] == "away" else "Home"
