@@ -288,10 +288,48 @@ def get_team_run_stats(team_id, season=None):
     }
 
 
-def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, std_dev=4.2):
+def get_pitcher_recent_form(pitcher_id, season=None, last_n=5):
+    """
+    A starting pitcher's runs-allowed-per-start over their last N starts,
+    plus innings pitched, so the spread model can react to a pitcher who's
+    been struggling or dealing recently - not just the team's full-season
+    ERA, which a single bad/great starter skews far less than the individual
+    game does. Returns None if too few starts are available yet.
+    """
+    if season is None:
+        season = datetime.utcnow().year
+    data = get(f"/people/{pitcher_id}/stats", {
+        "stats": "gameLog",
+        "group": "pitching",
+        "season": season
+    })
+    try:
+        splits = data["stats"][0]["splits"]
+    except (KeyError, IndexError):
+        return None
+    starts = [s for s in splits if s["stat"].get("gamesStarted") in ("1", 1)]
+    recent = starts[-last_n:]
+    if not recent:
+        return None
+    total_er = sum(int(s["stat"].get("earnedRuns", 0)) for s in recent)
+    total_ip = sum(float(s["stat"].get("inningsPitched", 0) or 0) for s in recent)
+    if total_ip == 0:
+        return None
+    recent_era = round((total_er / total_ip) * 9, 2)
+    return {
+        "starts_sampled": len(recent),
+        "recent_era": recent_era,
+        "innings_pitched_total": round(total_ip, 1),
+    }
+
+
+def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, std_dev=4.2,
+                       pitcher_a_form=None, pitcher_b_form=None, league_avg_era=4.20):
     """
     Estimate P(team_a covers `spread`) using a normal approximation
-    of MLB run-differential margin, adjusted for the park's run environment.
+    of MLB run-differential margin, adjusted for the park's run environment
+    and, when available, each side's starting pitcher's recent form.
+
     spread is from team_a's perspective, e.g. -1.5 (favorite) or +2.5 (dog).
     std_dev ~4.2 runs is a reasonable MLB single-game margin std dev (approx,
     derived from historical MLB scoring variance).
@@ -299,11 +337,36 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
     A park factor >100 raises scoring for both teams, which widens the
     plausible margin somewhat; applied as a mild scaling on std_dev since a
     higher-scoring environment tends to produce more spread-out final margins.
+
+    PITCHER ADJUSTMENT: team_a/b's runs_allowed_pg (a full-season, all-pitchers
+    average) is nudged toward the starting pitcher's own recent-start ERA,
+    when we have enough recent starts to trust it (starts_sampled >= 3).
+    This is a blend, not a replacement - a team's bullpen still plays a role
+    in the final runs-allowed number, so we don't want to hand the whole
+    game's expected runs to one pitcher's small sample. The blend weight
+    below (0.6 toward the pitcher) is a deliberate, disclosed choice, not a
+    fitted constant - treat this as directional, same as the rest of the
+    model.
     """
     if not team_a_stats or not team_b_stats:
         return None
-    expected_margin = (team_a_stats["runs_scored_pg"] - team_a_stats["runs_allowed_pg"]) - \
-                       (team_b_stats["runs_scored_pg"] - team_b_stats["runs_allowed_pg"])
+
+    def pitcher_adjusted_runs_allowed(team_runs_allowed_pg, pitcher_form, weight=0.6):
+        if not pitcher_form or pitcher_form.get("starts_sampled", 0) < 3:
+            return team_runs_allowed_pg
+        # recent_era is runs per 9 innings; runs_allowed_pg is runs per game
+        # (roughly runs per 9 innings too, for a full team game) - comparable
+        # units, so a direct blend is reasonable here.
+        pitcher_implied_runs_pg = pitcher_form["recent_era"]
+        return round(
+            team_runs_allowed_pg * (1 - weight) + pitcher_implied_runs_pg * weight, 2
+        )
+
+    a_runs_allowed = pitcher_adjusted_runs_allowed(team_a_stats["runs_allowed_pg"], pitcher_a_form)
+    b_runs_allowed = pitcher_adjusted_runs_allowed(team_b_stats["runs_allowed_pg"], pitcher_b_form)
+
+    expected_margin = (team_a_stats["runs_scored_pg"] - a_runs_allowed) - \
+                       (team_b_stats["runs_scored_pg"] - b_runs_allowed)
     park_scale = (park_run_factor / 100) ** 0.5  # dampened scaling, not linear
     adj_std_dev = std_dev * park_scale
     z = (spread + expected_margin) / adj_std_dev
@@ -383,14 +446,32 @@ def build_report():
 
         away_stats = team_run_stats_cache.get(g["away_team_id"])
         home_stats = team_run_stats_cache.get(g["home_team_id"])
+
+        # Pull each side's probable starter's recent-start form so the
+        # spread model reacts to who's actually pitching today, not just
+        # each team's full-season pitching average (a team can run 15-20+
+        # different pitchers through a season - the guy on the mound today
+        # matters far more than that blended average).
+        away_pitcher_form = get_pitcher_recent_form(g["away_pitcher_id"]) if g["away_pitcher_id"] else None
+        home_pitcher_form = get_pitcher_recent_form(g["home_pitcher_id"]) if g["home_pitcher_id"] else None
+
         for spread in (-1.5, 1.5, 2.5):
-            p_away = spread_cover_prob(away_stats, home_stats, spread, park_run_factor=park_r_factor)
-            p_home = spread_cover_prob(home_stats, away_stats, spread, park_run_factor=park_r_factor)
+            p_away = spread_cover_prob(
+                away_stats, home_stats, spread, park_run_factor=park_r_factor,
+                pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form
+            )
+            p_home = spread_cover_prob(
+                home_stats, away_stats, spread, park_run_factor=park_r_factor,
+                pitcher_a_form=home_pitcher_form, pitcher_b_form=away_pitcher_form
+            )
             entry["spread_lines"].append({
                 "spread": spread,
                 "away_cover_prob": p_away,
                 "home_cover_prob": p_home
             })
+
+        entry["away_pitcher_form"] = away_pitcher_form
+        entry["home_pitcher_form"] = home_pitcher_form
 
         report.append(entry)
     return report
@@ -430,6 +511,18 @@ def render_html(report):
                 raw_txt = f" (season raw: {raw*100:.0f}%)" if raw is not None else ""
                 rows.append(f"<li>{t}+ strikeouts: <b>{prob*100:.0f}%</b>{raw_txt}</li>")
             rows.append("</ul>")
+
+        rows.append("<h3>Starting Pitcher Recent Form (used in spread below)</h3>")
+        for label, form in ((g["away_team"], g.get("away_pitcher_form")),
+                             (g["home_team"], g.get("home_pitcher_form"))):
+            if form:
+                rows.append(f"<p class='sub'>{label}: {form['recent_era']} ERA over last "
+                            f"{form['starts_sampled']} starts ({form['innings_pitched_total']} IP)</p>")
+            else:
+                rows.append(f"<p class='sub'>{label}: recent form unavailable (fewer than 3 tracked "
+                            f"starts, or probable pitcher not yet announced) — spread uses team season "
+                            f"average only for this side.</p>")
+
         rows.append("<h3>Spread Cover Probabilities</h3>")
         rows.append(f"<table><tr><th>Spread</th><th>{g['away_team']}</th><th>{g['home_team']}</th></tr>")
         for s in g["spread_lines"]:
@@ -461,7 +554,7 @@ ul {{ margin: 4px 0 12px 0; padding-left: 18px; }}
 <body>
 <h1>MLB Daily Probabilities</h1>
 <p class="updated">Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</p>
-<p style="color:#f66; font-size:0.85em;">Estimates only, not guarantees. Verify actual lines at your sportsbook before betting. K probabilities are adjusted for opponent team strikeout tendency and park strikeout factor. Spread probabilities use season-long team run differential adjusted for park run factor. Platoon (handedness) splits are shown for context where large gaps exist, but the actual starting lineup's handedness mix is not fetched daily. Park factors: {PARK_FACTOR_SOURCE}. Treat all outputs as directional, not precise.</p>
+<p style="color:#f66; font-size:0.85em;">Estimates only, not guarantees. Verify actual lines at your sportsbook before betting. K probabilities are adjusted for opponent team strikeout tendency and park strikeout factor. Spread probabilities blend season-long team run differential with the probable starter's last-5-start ERA (when available), adjusted for park run factor. Platoon (handedness) splits are shown for context where large gaps exist, but the actual starting lineup's handedness mix is not fetched daily. Park factors: {PARK_FACTOR_SOURCE}. Treat all outputs as directional, not precise, and remember any single-game result can miss even a well-calibrated probability - that's expected variance, not necessarily a broken model.</p>
 {''.join(rows)}
 </body>
 </html>"""
@@ -472,7 +565,7 @@ if __name__ == "__main__":
     report = build_report()
     os.makedirs("docs", exist_ok=True)
     with open("docs/report.json", "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(report, f, indent=2, default=str)
     with open("docs/index.html", "w") as f:
         f.write(render_html(report))
     print(f"Done. {len(report)} games processed.")
