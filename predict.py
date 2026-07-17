@@ -58,10 +58,43 @@ PARK_FACTORS = {
     145: {"team": "White Sox",    "R": 98,  "H": 98,  "HR": 96,  "SO": 100, "BB": 103},
     147: {"team": "Yankees",      "R": 100, "H": 94,  "HR": 119, "SO": 101, "BB": 111},
 }
-# Source note shown in UI. If MLB adds/moves a franchise this table will be stale;
-# it is intentionally static (not scraped) because Baseball Savant does not expose
-# a documented free JSON endpoint for this data - only a web leaderboard.
 PARK_FACTOR_SOURCE = "RotoWire 2026 Park Factors (3yr rolling, pitching), published May 17, 2026"
+
+PARK_LOCATIONS = {
+    108: {"lat": 33.8003, "lon": -117.8827, "dome": False},
+    117: {"lat": 29.7573, "lon": -95.3555, "dome": True},
+    133: {"lat": 37.7126, "lon": -122.2005, "dome": False},
+    141: {"lat": 43.6414, "lon": -79.3894, "dome": True},
+    144: {"lat": 33.8908, "lon": -84.4678, "dome": False},
+    158: {"lat": 43.0280, "lon": -87.9712, "dome": True},
+    138: {"lat": 38.6226, "lon": -90.1928, "dome": False},
+    112: {"lat": 41.9484, "lon": -87.6553, "dome": False},
+    109: {"lat": 33.4455, "lon": -112.0667, "dome": True},
+    119: {"lat": 34.0739, "lon": -118.2400, "dome": False},
+    137: {"lat": 37.7786, "lon": -122.3893, "dome": False},
+    114: {"lat": 41.4962, "lon": -81.6852, "dome": False},
+    136: {"lat": 47.5914, "lon": -122.3325, "dome": True},
+    146: {"lat": 25.7781, "lon": -80.2196, "dome": True},
+    121: {"lat": 40.7571, "lon": -73.8458, "dome": False},
+    120: {"lat": 38.8730, "lon": -77.0074, "dome": False},
+    110: {"lat": 39.2839, "lon": -76.6218, "dome": False},
+    135: {"lat": 32.7076, "lon": -117.1570, "dome": False},
+    143: {"lat": 39.9061, "lon": -75.1665, "dome": False},
+    134: {"lat": 40.4469, "lon": -80.0057, "dome": False},
+    140: {"lat": 32.7473, "lon": -97.0945, "dome": True},
+    139: {"lat": 27.7683, "lon": -82.6534, "dome": True},
+    111: {"lat": 42.3467, "lon": -71.0972, "dome": False},
+    113: {"lat": 39.0975, "lon": -84.5061, "dome": False},
+    115: {"lat": 39.7559, "lon": -104.9942, "dome": False},
+    118: {"lat": 39.0517, "lon": -94.4803, "dome": False},
+    116: {"lat": 42.3390, "lon": -83.0485, "dome": False},
+    142: {"lat": 44.9817, "lon": -93.2776, "dome": False},
+    145: {"lat": 41.8299, "lon": -87.6338, "dome": False},
+    147: {"lat": 40.8296, "lon": -73.9262, "dome": False},
+}
+# Weather is skipped entirely for dome parks - real conditions inside a
+# closed/retractable roof don't match outdoor forecast data, and pretending
+# otherwise would produce a misleading adjustment.
 
 # ---------- low-level fetch ----------
 
@@ -91,6 +124,80 @@ def get_safe(path, params=None):
 
 
 # ---------- schedule / probable pitchers ----------
+
+def get_game_weather(team_id, game_date=None):
+    loc = PARK_LOCATIONS.get(team_id)
+    if not loc or loc.get("dome"):
+        return None
+    if game_date is None:
+        game_date = TODAY
+    try:
+        url = (f"https://api.open-meteo.com/v1/forecast?"
+               f"latitude={loc['lat']}&longitude={loc['lon']}"
+               f"&daily=temperature_2m_max,windspeed_10m_max,winddirection_10m_dominant"
+               f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+               f"&start_date={game_date}&end_date={game_date}&timezone=auto")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        daily = data.get("daily", {})
+        temp = daily.get("temperature_2m_max", [None])[0]
+        wind_speed = daily.get("windspeed_10m_max", [None])[0]
+        wind_dir = daily.get("winddirection_10m_dominant", [None])[0]
+        if temp is None and wind_speed is None:
+            return None
+        return {
+            "temp_f": round(temp, 1) if temp is not None else None,
+            "wind_mph": round(wind_speed, 1) if wind_speed is not None else None,
+            "wind_dir_deg": wind_dir,
+        }
+    except Exception:
+        return None
+
+
+def describe_weather_effect(weather):
+    if not weather:
+        return None
+    notes = []
+    temp = weather.get("temp_f")
+    wind = weather.get("wind_mph")
+    if temp is not None:
+        if temp >= 85:
+            notes.append(f"hot ({temp:.0f}F - ball tends to carry further)")
+        elif temp <= 50:
+            notes.append(f"cold ({temp:.0f}F - ball tends to carry less, mild boost to pitchers)")
+    if wind is not None and wind >= 15:
+        notes.append(f"windy ({wind:.0f} mph - can affect fly balls/control; "
+                      f"direction vs field orientation not factored in, check closer to first pitch)")
+    if not notes:
+        return "Weather looks unremarkable for scoring purposes."
+    return "Weather: " + "; ".join(notes) + "."
+
+
+def get_bullpen_recent_form(team_id, season=None):
+    if season is None:
+        season = datetime.utcnow().year
+    data = get_safe(f"/teams/{team_id}/stats", {
+        "stats": "season",
+        "group": "pitching",
+        "season": season
+    })
+    try:
+        stat = data["stats"][0]["splits"][0]["stat"]
+        era = float(stat.get("era", 0) or 0)
+        whip = float(stat.get("whip", 0) or 0)
+        games = int(stat.get("gamesPlayed", 0) or 0)
+        if not era or not games:
+            return None
+        return {
+            "staff_era": round(era, 2),
+            "staff_whip": round(whip, 2) if whip else None,
+            "note": "whole pitching staff ERA (starters + bullpen combined) - "
+                    "no clean bullpen-only split is available from this free source.",
+        }
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
 
 def get_todays_games(date=None):
     if date is None:
@@ -228,6 +335,64 @@ def assess_pitcher_fatigue(pitcher_id, before_date_str=TODAY, season=None):
         "is_fatigue_flag": is_short_rest or is_declining_innings,
         "note": "; ".join(notes) if notes else None,
     }
+
+
+def check_recent_il_activation(pitcher_id, before_date_str=TODAY, lookback_days=21):
+    """
+    Flags if a pitcher's own game log shows a start-to-start gap consistent
+    with an IL stint ending recently (a gap much longer than normal rest,
+    followed by a start within the lookback window). This is a heuristic
+    based on gaps in the pitcher's own start dates, NOT a direct read of
+    MLB's transaction log - can false-positive on a long All-Star break or
+    a skipped start for non-injury reasons. Always surfaced as "verify
+    before trusting", same framing as the WNBA return-from-absence heuristic.
+    """
+    data = get_safe(f"/people/{pitcher_id}/stats", {
+        "stats": "gameLog",
+        "group": "pitching",
+        "season": datetime.utcnow().year,
+    })
+    try:
+        splits = data["stats"][0]["splits"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    starts = [s for s in splits if s["stat"].get("gamesStarted") in ("1", 1)]
+    starts.sort(key=lambda s: s.get("date", ""))
+    if len(starts) < 2:
+        return None
+
+    try:
+        today_dt = datetime.strptime(before_date_str, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+    last_start = starts[-1]
+    try:
+        last_dt = datetime.strptime(last_start["date"], "%Y-%m-%d")
+    except (KeyError, ValueError):
+        return None
+
+    days_since_last_start = (today_dt - last_dt).days
+    if days_since_last_start > lookback_days:
+        return None
+
+    prev_start = starts[-2]
+    try:
+        prev_dt = datetime.strptime(prev_start["date"], "%Y-%m-%d")
+        gap = (last_dt - prev_dt).days
+    except (KeyError, ValueError):
+        gap = None
+    if gap is not None and gap >= 15:
+        return {
+            "flag": True,
+            "days_gap_before_return": gap,
+            "days_since_return_start": days_since_last_start,
+            "note": (f"gap of {gap} days between starts on "
+                     f"{prev_start.get('date')} and {last_start.get('date')} - "
+                     f"consistent with an IL stint or extended absence. Verify "
+                     f"actual injury status before trusting this in a bet."),
+        }
+    return {"flag": False}
 
 
 # ---------- today's lineup handedness (for pitcher-vs-lineup matchup) ----------
@@ -410,18 +575,87 @@ def get_team_k_rate(team_id, season=None):
         return None
 
 
+def get_team_k_rate_recent(team_id, season=None, last_n=12):
+    """
+    Opponent's strikeouts-as-batter per game over its last N games (not
+    season-long). Reuses the completed-games schedule approach used for
+    run trend, then pulls boxscore K totals per game - one boxscore call
+    per completed game in the window. Returns None below 5 games found.
+    """
+    if season is None:
+        season = datetime.utcnow().year
+    end = datetime.utcnow().strftime("%Y-%m-%d")
+    start = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+    data = get_safe("/schedule", {
+        "sportId": 1,
+        "teamId": team_id,
+        "startDate": start,
+        "endDate": end,
+        "season": season,
+    })
+    try:
+        dates = data.get("dates", [])
+    except AttributeError:
+        return None
+    game_pks = []
+    for d in dates:
+        for game in d.get("games", []):
+            if game.get("status", {}).get("codedGameState") == "F":
+                game_pks.append(game.get("gamePk"))
+    game_pks = game_pks[-last_n:]
+    if len(game_pks) < 5:
+        return None
+
+    k_totals = []
+    for pk in game_pks:
+        box = get_safe(f"/game/{pk}/boxscore")
+        if not box:
+            continue
+        teams = box.get("teams", {})
+        for side in ("home", "away"):
+            t = teams.get(side, {})
+            if t.get("team", {}).get("id") == team_id:
+                k = t.get("teamStats", {}).get("batting", {}).get("strikeOuts")
+                if k is not None:
+                    k_totals.append(k)
+    if len(k_totals) < 5:
+        return None
+    return round(sum(k_totals) / len(k_totals), 2)
+
+
+def rank_team_k_rate(team_id, team_k_cache):
+    """
+    Where this team's strikeout rate ranks among teams playing today, e.g.
+    "3rd of 20 teams in action today" - scoped to today's slate (the data
+    already being fetched) rather than all 30 teams, to avoid extra calls
+    purely for a ranking display.
+    """
+    valid = [(tid, k) for tid, k in team_k_cache.items() if k]
+    if not valid or team_id not in team_k_cache or not team_k_cache[team_id]:
+        return None
+    ranked = sorted(valid, key=lambda x: x[1], reverse=True)
+    for i, (tid, _) in enumerate(ranked, start=1):
+        if tid == team_id:
+            return {"rank": i, "of": len(ranked)}
+    return None
+
+
 def adjust_k_floor_for_opponent(base_probs, opponent_k_per_game, league_avg=LEAGUE_AVG_K_PER_GAME_FALLBACK):
     """
     Nudge strikeout-floor probabilities based on how strikeout-prone the
     opposing lineup is relative to league average.
-    This is a simple multiplicative adjustment on the underlying "rate", not
-    a rigorous model - treat it as a directional adjustment, not gospel.
+
+    HONESTY NOTE on the 0.5 dampening factor: this is a deliberate,
+    disclosed guess to keep a single stat from overcorrecting - it has
+    not been backtested or fitted against actual prop outcomes. Same
+    caveat applies to the other dampening constants in this file (park
+    scaling, fatigue penalty) - all directional choices, not calibrated
+    weights.
     """
     if not base_probs or not opponent_k_per_game or not league_avg:
         return base_probs
     factor = opponent_k_per_game / league_avg
-    # dampen the adjustment so a single stat doesn't overcorrect
-    factor = 1 + (factor - 1) * 0.5
+    factor = 1 + (factor - 1) * 0.5  # UNFITTED CONSTANT - see docstring
     adjusted = {}
     for threshold, prob in base_probs.items():
         new_prob = prob * factor
@@ -539,6 +773,58 @@ def get_team_run_stats(team_id, season=None):
     }
 
 
+def get_team_recent_run_trend(team_id, season=None, last_n=12):
+    """
+    Team's runs scored and runs allowed per game over its last N games
+    (not season-long average) - lets current form pull the expected margin
+    away from a stale full-season number. Uses the team's completed-games
+    schedule since MLB Stats API doesn't expose a "last N games" team stat
+    directly. Returns None if fewer than 5 completed games are available.
+    """
+    if season is None:
+        season = datetime.utcnow().year
+    end = datetime.utcnow().strftime("%Y-%m-%d")
+    start = (datetime.utcnow() - timedelta(days=45)).strftime("%Y-%m-%d")
+    data = get_safe("/schedule", {
+        "sportId": 1,
+        "teamId": team_id,
+        "startDate": start,
+        "endDate": end,
+        "season": season,
+    })
+    try:
+        dates = data.get("dates", [])
+    except AttributeError:
+        return None
+    games = []
+    for d in dates:
+        for game in d.get("games", []):
+            if game.get("status", {}).get("codedGameState") != "F":
+                continue
+            teams = game.get("teams", {})
+            for side in ("home", "away"):
+                t = teams.get(side, {})
+                if t.get("team", {}).get("id") == team_id:
+                    opp_side = "away" if side == "home" else "home"
+                    runs_for = t.get("score")
+                    runs_against = teams.get(opp_side, {}).get("score")
+                    if runs_for is not None and runs_against is not None:
+                        games.append({
+                            "date": game.get("officialDate", d.get("date")),
+                            "runs_for": runs_for,
+                            "runs_against": runs_against,
+                        })
+    games.sort(key=lambda g: g["date"])
+    recent = games[-last_n:]
+    if len(recent) < 5:
+        return None
+    return {
+        "games_sampled": len(recent),
+        "runs_scored_pg": round(sum(g["runs_for"] for g in recent) / len(recent), 2),
+        "runs_allowed_pg": round(sum(g["runs_against"] for g in recent) / len(recent), 2),
+    }
+
+
 def get_pitcher_recent_form(pitcher_id, season=None, last_n=5):
     """
     A starting pitcher's runs-allowed-per-start over their last N starts,
@@ -576,62 +862,299 @@ def get_pitcher_recent_form(pitcher_id, season=None, last_n=5):
 
 def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, std_dev=4.2,
                        pitcher_a_form=None, pitcher_b_form=None, pitcher_a_fatigue=None,
-                       pitcher_b_fatigue=None, league_avg_era=4.20):
+                       pitcher_b_fatigue=None, league_avg_era=4.20,
+                       team_a_recent=None, team_b_recent=None,
+                       bullpen_a=None, bullpen_b=None, weather_a=None):
     """
-    Estimate P(team_a covers `spread`) using a normal approximation
-    of MLB run-differential margin, adjusted for the park's run environment
-    and, when available, each side's starting pitcher's recent form and
-    fatigue status.
+    Estimate P(team_a covers `spread`) using a normal approximation of MLB
+    run-differential margin.
 
-    spread is from team_a's perspective, e.g. -1.5 (favorite) or +2.5 (dog).
-    std_dev ~4.2 runs is a reasonable MLB single-game margin std dev (approx,
-    derived from historical MLB scoring variance).
-    park_run_factor: the game's venue R factor (100 = neutral) from PARK_FACTORS.
-    A park factor >100 raises scoring for both teams, which widens the
-    plausible margin somewhat; applied as a mild scaling on std_dev since a
-    higher-scoring environment tends to produce more spread-out final margins.
+    Blend inputs (each optional, gracefully degrading if missing):
+      - team_x_stats: full-season runs_scored_pg / runs_allowed_pg (baseline)
+      - team_x_recent: last-~12-game runs trend (get_team_recent_run_trend)
+      - pitcher_x_form: probable starter's last-5-start ERA
+      - bullpen_x: team staff ERA proxy (get_bullpen_recent_form)
+      - pitcher_x_fatigue: short-rest/declining-innings flag
+      - weather_a: home-park weather snapshot
 
-    PITCHER ADJUSTMENT: team_a/b's runs_allowed_pg (a full-season, all-pitchers
-    average) is nudged toward the starting pitcher's own recent-start ERA,
-    when we have enough recent starts to trust it (starts_sampled >= 3).
-    This is a blend, not a replacement - a team's bullpen still plays a role
-    in the final runs-allowed number, so we don't want to hand the whole
-    game's expected runs to one pitcher's small sample. The blend weight
-    below (0.6 toward the pitcher) is a deliberate, disclosed choice, not a
-    fitted constant - treat this as directional, same as the rest of the
-    model.
+    WEIGHTS (re-balanced now that bullpen and recent-team-form are separate
+    inputs, not folded into "starter + season" alone):
+      runs_allowed = 0.40 season + 0.20 recent-team + 0.30 starter + 0.10 bullpen
+    A missing input's weight is redistributed proportionally across whatever
+    IS available, rather than assuming a league-average value for it.
+    ALL WEIGHTS ABOVE ARE DISCLOSED, UNFITTED CHOICES - not backtested
+    against settled results. Treat every output as directional, not gospel.
 
-    FATIGUE ADJUSTMENT: if the pitcher is flagged as fatigued (short rest
-    or a declining innings trend - see assess_pitcher_fatigue), the
-    pitcher-implied runs-allowed number gets a small additional penalty on
-    top of the blend above. Deliberately small and disclosed, not fitted.
+    spread is from team_a's perspective. std_dev ~4.2 runs is an approximate
+    MLB single-game margin std dev. park_run_factor: venue R factor (100=neutral).
     """
     if not team_a_stats or not team_b_stats:
         return None
 
-    def pitcher_adjusted_runs_allowed(team_runs_allowed_pg, pitcher_form, fatigue, weight=0.6):
-        if not pitcher_form or pitcher_form.get("starts_sampled", 0) < 3:
-            return team_runs_allowed_pg
-        # recent_era is runs per 9 innings; runs_allowed_pg is runs per game
-        # (roughly runs per 9 innings too, for a full team game) - comparable
-        # units, so a direct blend is reasonable here.
-        pitcher_implied_runs_pg = pitcher_form["recent_era"]
-        if fatigue and fatigue.get("is_fatigue_flag"):
-            pitcher_implied_runs_pg *= 1.08  # small, disclosed fatigue penalty
-        return round(
-            team_runs_allowed_pg * (1 - weight) + pitcher_implied_runs_pg * weight, 2
-        )
+    def blended_runs_allowed(season_allowed, recent, pitcher_form, bullpen, fatigue):
+        components = [(season_allowed, 0.40)]
+        if recent and recent.get("runs_allowed_pg") is not None:
+            components.append((recent["runs_allowed_pg"], 0.20))
+        if pitcher_form and pitcher_form.get("starts_sampled", 0) >= 3:
+            starter_val = pitcher_form["recent_era"]
+            if fatigue and fatigue.get("is_fatigue_flag"):
+                starter_val *= 1.08  # small, disclosed fatigue penalty - unfitted
+            components.append((starter_val, 0.30))
+        if bullpen and bullpen.get("staff_era"):
+            components.append((bullpen["staff_era"], 0.10))
+        total_weight = sum(w for _, w in components)
+        if total_weight == 0:
+            return season_allowed
+        return round(sum(v * w for v, w in components) / total_weight, 2)
 
-    a_runs_allowed = pitcher_adjusted_runs_allowed(team_a_stats["runs_allowed_pg"], pitcher_a_form, pitcher_a_fatigue)
-    b_runs_allowed = pitcher_adjusted_runs_allowed(team_b_stats["runs_allowed_pg"], pitcher_b_form, pitcher_b_fatigue)
+    def blended_runs_scored(season_scored, recent):
+        if recent and recent.get("runs_scored_pg") is not None:
+            return round(season_scored * 0.7 + recent["runs_scored_pg"] * 0.3, 2)
+        return season_scored
 
-    expected_margin = (team_a_stats["runs_scored_pg"] - a_runs_allowed) - \
-                       (team_b_stats["runs_scored_pg"] - b_runs_allowed)
-    park_scale = (park_run_factor / 100) ** 0.5  # dampened scaling, not linear
-    adj_std_dev = std_dev * park_scale
+    a_runs_allowed = blended_runs_allowed(
+        team_a_stats["runs_allowed_pg"], team_a_recent, pitcher_a_form, bullpen_a, pitcher_a_fatigue)
+    b_runs_allowed = blended_runs_allowed(
+        team_b_stats["runs_allowed_pg"], team_b_recent, pitcher_b_form, bullpen_b, pitcher_b_fatigue)
+    a_runs_scored = blended_runs_scored(team_a_stats["runs_scored_pg"], team_a_recent)
+    b_runs_scored = blended_runs_scored(team_b_stats["runs_scored_pg"], team_b_recent)
+
+    expected_margin = (a_runs_scored - a_runs_allowed) - (b_runs_scored - b_runs_allowed)
+
+    park_scale = (park_run_factor / 100) ** 0.5  # dampened scaling, not linear - unfitted
+    weather_scale = 1.0
+    if weather_a:
+        wind = weather_a.get("wind_mph")
+        if wind is not None and wind >= 15:
+            weather_scale = 1.05  # small widening of variance - unfitted, no wind-direction data
+    adj_std_dev = std_dev * park_scale * weather_scale
+
     z = (spread + expected_margin) / adj_std_dev
     prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
     return round(prob, 3)
+
+
+# ---------- batter props ----------
+# Section D: batter prop floors (hits, HR, RBI, total bases), opponent
+# pitcher matchup context, home/away splits, recent-return-from-injury
+# flag. Roughly doubles the fetch surface vs. pitcher-only (batters +
+# pitchers instead of just pitchers) - one call per confirmed lineup
+# player for game logs, so this only runs for lineups that are posted.
+
+def get_confirmed_lineup_player_ids(game_pk, team_id):
+    """
+    Returns a list of {"id", "name", "bat_side"} for the confirmed starting
+    lineup (battingOrder) of one team in one game, or [] if not posted yet.
+    Reuses the same boxscore call pattern as get_confirmed_lineup_handedness.
+    """
+    data = get_safe(f"/game/{game_pk}/boxscore")
+    if not data:
+        return []
+    teams = data.get("teams", {})
+    side = None
+    for key in ("home", "away"):
+        t = teams.get(key, {})
+        if t.get("team", {}).get("id") == team_id:
+            side = t
+            break
+    if not side:
+        return []
+    batting_order_ids = side.get("battingOrder", [])
+    if not batting_order_ids:
+        return []
+    players = side.get("players", {})
+    out = []
+    for pid in batting_order_ids:
+        key = f"ID{pid}"
+        player = players.get(key, {})
+        person = player.get("person", {})
+        out.append({
+            "id": pid,
+            "name": person.get("fullName", "Unknown"),
+            "bat_side": player.get("batSide", {}).get("code"),
+        })
+    return out
+
+
+def get_batter_recent_game_logs(batter_id, season=None, last_n=15):
+    """
+    Batter's last N game logs (hits, home runs, RBIs, total bases per
+    game), used as the empirical base for prop floor probabilities - same
+    pattern as get_pitcher_recent_strikeouts but for hitting stats.
+    """
+    if season is None:
+        season = datetime.utcnow().year
+    data = get_safe(f"/people/{batter_id}/stats", {
+        "stats": "gameLog",
+        "group": "hitting",
+        "season": season
+    })
+    try:
+        splits = data["stats"][0]["splits"]
+    except (KeyError, IndexError, TypeError):
+        return []
+    games = []
+    for s in splits[-last_n:]:
+        stat = s.get("stat", {})
+        try:
+            games.append({
+                "date": s.get("date"),
+                "hits": int(stat.get("hits", 0)),
+                "home_runs": int(stat.get("homeRuns", 0)),
+                "rbi": int(stat.get("rbi", 0)),
+                "total_bases": int(stat.get("totalBases", 0)),
+                "is_home": s.get("isHome"),
+            })
+        except (TypeError, ValueError):
+            continue
+    return games
+
+
+def batter_prop_floor_probs(game_logs, thresholds=None):
+    """
+    Empirical probability of hitting each prop threshold, based on recent
+    games - same style as strikeout_floor_probs. thresholds is a dict of
+    {stat_key: [threshold values]}, defaults cover the common markets.
+    """
+    if thresholds is None:
+        thresholds = {
+            "hits": [1, 2],
+            "home_runs": [1],
+            "rbi": [1, 2],
+            "total_bases": [1, 2, 3],
+        }
+    n = len(game_logs)
+    if n == 0:
+        return {}
+    probs = {}
+    for stat_key, t_list in thresholds.items():
+        probs[stat_key] = {}
+        for t in t_list:
+            hits = sum(1 for g in game_logs if g.get(stat_key, 0) >= t)
+            probs[stat_key][t] = round(hits / n, 3)
+    return probs
+
+
+def get_batter_home_away_split(game_logs):
+    """
+    Batter's hits-per-game at home vs. away, from the same recent game
+    logs already fetched (no extra API call) - mirrors the home/away
+    split feature already built for other markets.
+    """
+    home_games = [g for g in game_logs if g.get("is_home") is True]
+    away_games = [g for g in game_logs if g.get("is_home") is False]
+    if not home_games and not away_games:
+        return None
+    return {
+        "home_games_sampled": len(home_games),
+        "home_hits_per_game": round(sum(g["hits"] for g in home_games) / len(home_games), 2) if home_games else None,
+        "away_games_sampled": len(away_games),
+        "away_hits_per_game": round(sum(g["hits"] for g in away_games) / len(away_games), 2) if away_games else None,
+    }
+
+
+def get_opponent_pitcher_matchup_context(pitcher_id, batter_hand, season=None):
+    """
+    Opposing starter's K-rate against the batter's specific handedness -
+    mirrors the platoon-split logic already built for pitcher-vs-lineup,
+    just flipped to batter-vs-pitcher. Directly relevant to "will this
+    batter get a hit" props: a pitcher who K's same-handed batters at a
+    high rate is a real headwind for that specific batter's hit props.
+    Returns None if handedness is unknown or the split sample is too small
+    (reuses get_pitcher_k_rate_vs_hand's own >=20-batters-faced floor).
+    """
+    if not batter_hand or batter_hand not in ("L", "R", "S"):
+        return None
+    # Switch hitters bat opposite the pitcher's throwing hand by convention;
+    # approximate with 'vr' (vs RHB) since most switch-hitter platoon data
+    # isn't broken out further by this free API - disclosed approximation.
+    sitcode = "vl" if batter_hand == "L" else "vr"
+    k_rate = get_pitcher_k_rate_vs_hand(pitcher_id, sitcode, season)
+    if k_rate is None:
+        return None
+    return {
+        "sitcode": sitcode,
+        "pitcher_k_rate_vs_this_handedness": round(k_rate, 3),
+        "note": ("approximated using vs-RHB split (switch hitter)" if batter_hand == "S" else None),
+    }
+
+
+def check_batter_recent_il_activation(batter_id, before_date_str=TODAY, lookback_days=21):
+    """
+    Same heuristic as check_recent_il_activation but for batters: a gap in
+    the batter's own game log consistent with an IL stint or extended
+    absence ending recently. Batters play far more frequently than
+    pitchers start, so a much shorter gap (5+ days with no games, vs. a
+    pitcher's normal 4-6 day rest cycle) is the meaningful signal here.
+    Always surfaced as "verify before trusting" - can false-positive on
+    a scheduled off day, a bench day, or a callup/demotion.
+    """
+    data = get_safe(f"/people/{batter_id}/stats", {
+        "stats": "gameLog",
+        "group": "hitting",
+        "season": datetime.utcnow().year,
+    })
+    try:
+        splits = data["stats"][0]["splits"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    dates = sorted(s.get("date") for s in splits if s.get("date"))
+    if len(dates) < 2:
+        return None
+    try:
+        today_dt = datetime.strptime(before_date_str, "%Y-%m-%d")
+        last_dt = datetime.strptime(dates[-1], "%Y-%m-%d")
+    except ValueError:
+        return None
+    days_since_last = (today_dt - last_dt).days
+    if days_since_last > lookback_days:
+        return None
+    prev_dt = datetime.strptime(dates[-2], "%Y-%m-%d")
+    gap = (last_dt - prev_dt).days
+    if gap >= 10:  # meaningfully longer than a normal 1-3 day gap between games played
+        return {
+            "flag": True,
+            "days_gap_before_return": gap,
+            "note": (f"gap of {gap} days between games played, ending {dates[-1]} - "
+                     f"consistent with an IL stint or extended absence. Verify actual "
+                     f"injury/roster status before trusting this in a bet."),
+        }
+    return {"flag": False}
+
+
+def build_batter_props_for_game(game, opp_pitcher_id_by_side):
+    """
+    Builds batter prop entries for both confirmed lineups in a game.
+    Returns [] for a side if its lineup isn't posted yet (honest
+    unavailability, same pattern as the pitcher-vs-lineup matchup read).
+    """
+    results = []
+    for side, team_id, opp_side in (("away", game["away_team_id"], "home"),
+                                     ("home", game["home_team_id"], "away")):
+        lineup = get_confirmed_lineup_player_ids(game["gamePk"], team_id)
+        if not lineup:
+            continue
+        opp_pitcher_id = opp_pitcher_id_by_side.get(opp_side)
+        for player in lineup:
+            logs = get_batter_recent_game_logs(player["id"])
+            if not logs:
+                continue
+            floors = batter_prop_floor_probs(logs)
+            splits = get_batter_home_away_split(logs)
+            matchup = (get_opponent_pitcher_matchup_context(opp_pitcher_id, player["bat_side"])
+                       if opp_pitcher_id else None)
+            il_check = check_batter_recent_il_activation(player["id"])
+            results.append({
+                "name": player["name"],
+                "side": side,
+                "bat_side": player["bat_side"],
+                "games_sampled": len(logs),
+                "floor_probabilities": floors,
+                "home_away_split": splits,
+                "opponent_pitcher_matchup": matchup,
+                "il_check": il_check,
+            })
+    return results
 
 
 # ---------- main ----------
@@ -644,12 +1167,24 @@ def build_report():
     # than a hardcoded guess.
     team_k_cache = {}
     team_run_stats_cache = {}
+    team_k_recent_cache = {}
+    team_run_recent_cache = {}
+    team_bullpen_cache = {}
     for g in games:
         for tid in (g["away_team_id"], g["home_team_id"]):
             if tid not in team_k_cache:
                 team_k_cache[tid] = get_team_k_rate(tid)
             if tid not in team_run_stats_cache:
                 team_run_stats_cache[tid] = get_team_run_stats(tid)
+            if tid not in team_run_recent_cache:
+                team_run_recent_cache[tid] = get_team_recent_run_trend(tid)
+            if tid not in team_bullpen_cache:
+                team_bullpen_cache[tid] = get_bullpen_recent_form(tid)
+            # Recent opponent K-rate trend is more expensive (one boxscore
+            # call per recent game), so only fetch it for teams actually
+            # appearing as an OPPONENT of a probable starter today - handled
+            # lazily below via team_k_recent_cache instead of pre-fetching
+            # for every team here.
     valid_k_rates = [v for v in team_k_cache.values() if v]
     league_avg_k = (sum(valid_k_rates) / len(valid_k_rates)) if valid_k_rates else LEAGUE_AVG_K_PER_GAME_FALLBACK
 
@@ -676,14 +1211,28 @@ def build_report():
                 continue
             k_list = get_pitcher_recent_strikeouts(pid)
             base_probs = strikeout_floor_probs(k_list)
-            opp_k_rate = team_k_cache.get(opp_id)
+
+            # Opponent K tendency: prefer the RECENT (last-~12-game) trend
+            # over the season-long rate when we have it, since a lineup's
+            # current form matters more than its full-season number.
+            if opp_id not in team_k_recent_cache:
+                team_k_recent_cache[opp_id] = get_team_k_rate_recent(opp_id)
+            opp_k_rate_recent = team_k_recent_cache.get(opp_id)
+            opp_k_rate_season = team_k_cache.get(opp_id)
+            opp_k_rate = opp_k_rate_recent if opp_k_rate_recent else opp_k_rate_season
+            opp_k_source = "recent (~12 games)" if opp_k_rate_recent else "season" if opp_k_rate_season else None
+            opp_k_league_rank = rank_team_k_rate(opp_id, team_k_cache)
+
             adjusted_probs = adjust_k_floor_for_opponent(base_probs, opp_k_rate, league_avg_k)
             platoon = get_pitcher_platoon_splits(pid)
             fatigue = assess_pitcher_fatigue(pid)
+            il_check = check_recent_il_activation(pid)
 
-            # Apply park SO factor as a further mild adjustment (park factors
-            # affect strikeout rates too - e.g. Coors suppresses K's, Mariners'
-            # park inflates them). Dampened the same way as the opponent adjustment.
+            # Park SO factor: a further mild adjustment (e.g. Coors
+            # suppresses K's, Mariners' park inflates them). Dampened the
+            # same way as the opponent adjustment. UNFITTED CONSTANT (0.5),
+            # same honesty caveat as adjust_k_floor_for_opponent - directional
+            # guess, not backtested against settled outcomes.
             park_so_factor = park["SO"] if park else 100
             park_scale = 1 + ((park_so_factor / 100) - 1) * 0.5
             park_adjusted_probs = {
@@ -691,10 +1240,18 @@ def build_report():
                 for t, p in adjusted_probs.items()
             }
 
+            # Weather: wind suppresses offense broadly, and can modestly
+            # affect K rate too (batters more tentative in poor conditions).
+            # Small, disclosed, unfitted - same caveat as everything else.
+            weather = get_game_weather(g["home_team_id"])
+            weather_desc = describe_weather_effect(weather)
+            if weather and weather.get("wind_mph") and weather["wind_mph"] >= 15:
+                park_adjusted_probs = {
+                    t: round(max(0.0, min(1.0, p * 1.03)), 3) for t, p in park_adjusted_probs.items()
+                }
+
             # A fatigue flag (short rest or declining innings) nudges K-floors
-            # down slightly - a tired starter is less likely to reach deep
-            # strikeout counts even if his season rate says otherwise.
-            # Dampened deliberately: this is directional, not a fitted weight.
+            # down slightly. UNFITTED CONSTANT (0.92) - directional, not fitted.
             if fatigue and fatigue["is_fatigue_flag"]:
                 park_adjusted_probs = {
                     t: round(max(0.0, p * 0.92), 3) for t, p in park_adjusted_probs.items()
@@ -714,10 +1271,15 @@ def build_report():
                 "floor_probabilities_opponent_adjusted": adjusted_probs,
                 "floor_probabilities_final": park_adjusted_probs,
                 "opponent_k_per_game": round(opp_k_rate, 2) if opp_k_rate else None,
+                "opponent_k_source": opp_k_source,
+                "opponent_k_league_rank": opp_k_league_rank,
                 "league_avg_k_per_game": round(league_avg_k, 2),
                 "park_so_factor": park_so_factor,
+                "weather": weather,
+                "weather_description": weather_desc,
                 "platoon": platoon,
                 "fatigue": fatigue,
+                "il_check": il_check,
                 "lineup_matchup": lineup_matchup,
             })
 
@@ -730,6 +1292,12 @@ def build_report():
         away_pitcher_form = get_pitcher_recent_form(g["away_pitcher_id"]) if g["away_pitcher_id"] else None
         home_pitcher_form = get_pitcher_recent_form(g["home_pitcher_id"]) if g["home_pitcher_id"] else None
 
+        away_recent = team_run_recent_cache.get(g["away_team_id"])
+        home_recent = team_run_recent_cache.get(g["home_team_id"])
+        away_bullpen = team_bullpen_cache.get(g["away_team_id"])
+        home_bullpen = team_bullpen_cache.get(g["home_team_id"])
+        game_weather = get_game_weather(g["home_team_id"])
+
         # Reuse fatigue already computed in the pitcher loop above, rather
         # than calling assess_pitcher_fatigue a second time.
         away_pitcher_fatigue = next((p["fatigue"] for p in entry["pitchers"] if p["side"] == "away"), None)
@@ -739,12 +1307,16 @@ def build_report():
             p_away = spread_cover_prob(
                 away_stats, home_stats, spread, park_run_factor=park_r_factor,
                 pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
-                pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue
+                pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
+                team_a_recent=away_recent, team_b_recent=home_recent,
+                bullpen_a=away_bullpen, bullpen_b=home_bullpen, weather_a=game_weather,
             )
             p_home = spread_cover_prob(
                 home_stats, away_stats, spread, park_run_factor=park_r_factor,
                 pitcher_a_form=home_pitcher_form, pitcher_b_form=away_pitcher_form,
-                pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue
+                pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue,
+                team_a_recent=home_recent, team_b_recent=away_recent,
+                bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
             )
             entry["spread_lines"].append({
                 "spread": spread,
@@ -754,6 +1326,17 @@ def build_report():
 
         entry["away_pitcher_form"] = away_pitcher_form
         entry["home_pitcher_form"] = home_pitcher_form
+        entry["away_recent_trend"] = away_recent
+        entry["home_recent_trend"] = home_recent
+        entry["away_bullpen"] = away_bullpen
+        entry["home_bullpen"] = home_bullpen
+        entry["weather"] = game_weather
+        entry["weather_description"] = describe_weather_effect(game_weather)
+
+        # Batter props (Section D) - only populated once lineups are
+        # posted; empty list is a normal, honest state earlier in the day.
+        opp_pitcher_id_by_side = {"away": g["away_pitcher_id"], "home": g["home_pitcher_id"]}
+        entry["batter_props"] = build_batter_props_for_game(g, opp_pitcher_id_by_side)
 
         report.append(entry)
     return report
@@ -811,6 +1394,25 @@ def render_html(report):
             block.append('</div>')
         block.append('</div>')
 
+        block.append('<ul class="why-list">')
+        for label, recent, bullpen, form in (
+            (g["away_team"], g.get("away_recent_trend"), g.get("away_bullpen"), g.get("away_pitcher_form")),
+            (g["home_team"], g.get("home_recent_trend"), g.get("home_bullpen"), g.get("home_pitcher_form")),
+        ):
+            if recent:
+                block.append(f'<li>{label} last {recent["games_sampled"]} games: '
+                             f'{recent["runs_scored_pg"]} runs/gm scored, {recent["runs_allowed_pg"]} allowed</li>')
+            else:
+                block.append(f'<li class="vs-opp-empty">{label} recent-game trend unavailable - using season average only</li>')
+            if form:
+                block.append(f'<li>{label} starter: {form["recent_era"]} ERA over last {form["starts_sampled"]} starts</li>')
+            if bullpen:
+                block.append(f'<li>{label} pitching staff ERA: {bullpen["staff_era"]} '
+                             f'<span class="vs-opp-empty">(whole staff, not bullpen-isolated - see disclaimer)</span></li>')
+        if g.get("weather_description"):
+            block.append(f'<li>{g["weather_description"]}</li>')
+        block.append('</ul>')
+
         block.append('<h3 class="section-label">Starting Pitchers</h3>')
         for p in g["pitchers"]:
             side_label = g["away_team"] if p["side"] == "away" else g["home_team"]
@@ -821,6 +1423,11 @@ def render_html(report):
             fatigue = p.get("fatigue")
             if fatigue and fatigue.get("note"):
                 block.append(f'<div class="flag-chip flag-chip-inline">&#9888; {fatigue["note"].capitalize()}.</div>')
+
+            il_check = p.get("il_check")
+            if il_check and il_check.get("flag"):
+                block.append(f'<div class="flag-chip flag-chip-inline">&#9888; Possible recent IL/absence: '
+                             f'{il_check["note"]}</div>')
 
             lineup_matchup = p.get("lineup_matchup")
             if lineup_matchup:
@@ -835,7 +1442,20 @@ def render_html(report):
                              f'K rate vs LHB {platoon["k_rate_vs_lhb"]*100:.0f}% &middot; '
                              f'K rate vs RHB {platoon["k_rate_vs_rhb"]*100:.0f}%</p>')
 
-            form = p.get("recent_era_form")
+            block.append('<ul class="why-list">')
+            block.append(f'<li>Own recent K trend: last {p["recent_starts_sampled"]} starts, '
+                         f'{p["recent_k_values"]}</li>')
+            if p.get("opponent_k_per_game"):
+                rank = p.get("opponent_k_league_rank")
+                rank_txt = f' &middot; ranks {rank["rank"]} of {rank["of"]} teams playing today' if rank else ''
+                block.append(f'<li>Opponent K rate ({p.get("opponent_k_source","season")}): '
+                             f'{p["opponent_k_per_game"]}/game vs league avg {p["league_avg_k_per_game"]}{rank_txt}</li>')
+            if p.get("weather_description"):
+                block.append(f'<li>{p["weather_description"]}</li>')
+            block.append(f'<li class="vs-opp-empty">Park SO factor {p.get("park_so_factor",100)} '
+                         f'and dampening constants below are directional guesses, not backtested</li>')
+            block.append('</ul>')
+
             block.append('<div class="stat-group">')
             block.append('<span class="stat-group-label">Strikeouts</span>')
             block.append('<div class="pill-row">')
@@ -847,17 +1467,48 @@ def render_html(report):
             block.append('</div>')
             block.append('</div>')
 
-        block.append('<h3 class="section-label">Starter Recent Run Prevention (used in spread above)</h3>')
-        block.append('<div class="spread-block">')
-        for label, form in ((g["away_team"], g.get("away_pitcher_form")),
-                             (g["home_team"], g.get("home_pitcher_form"))):
-            if form:
-                block.append(f'<p class="rest-line">{label}: {form["recent_era"]} ERA over last '
-                             f'{form["starts_sampled"]} starts ({form["innings_pitched_total"]} IP)</p>')
-            else:
-                block.append(f'<p class="rest-line vs-opp-empty">{label}: recent form unavailable - '
-                             f'spread uses team season average only for this side.</p>')
-        block.append('</div>')
+        batter_props = g.get("batter_props") or []
+        if batter_props:
+            block.append('<h3 class="section-label">Batter Props</h3>')
+            for b in batter_props:
+                side_label = g["away_team"] if b["side"] == "away" else g["home_team"]
+                block.append('<div class="player-block">')
+                block.append(f'<p class="player-name">{b["name"]} <span class="games-sampled">'
+                             f'{side_label} &middot; bats {b.get("bat_side","?")} &middot; last {b["games_sampled"]} games</span></p>')
+
+                il_check = b.get("il_check")
+                if il_check and il_check.get("flag"):
+                    block.append(f'<div class="flag-chip flag-chip-inline">&#9888; Possible recent IL/absence: '
+                                 f'{il_check["note"]}</div>')
+
+                matchup = b.get("opponent_pitcher_matchup")
+                if matchup:
+                    note = f' ({matchup["note"]})' if matchup.get("note") else ''
+                    block.append(f'<p class="vs-opp-line">Opposing starter K rate vs this handedness: '
+                                 f'{matchup["pitcher_k_rate_vs_this_handedness"]*100:.0f}%{note}</p>')
+
+                splits = b.get("home_away_split")
+                if splits and splits.get("home_hits_per_game") is not None and splits.get("away_hits_per_game") is not None:
+                    block.append(f'<p class="vs-opp-line">Hits/game: {splits["home_hits_per_game"]} at home '
+                                 f'({splits["home_games_sampled"]} gm) &middot; {splits["away_hits_per_game"]} away '
+                                 f'({splits["away_games_sampled"]} gm)</p>')
+
+                floors = b.get("floor_probabilities") or {}
+                for stat_key, stat_label in (("hits", "Hits"), ("home_runs", "HR"),
+                                              ("rbi", "RBI"), ("total_bases", "Total Bases")):
+                    thresholds = floors.get(stat_key)
+                    if not thresholds:
+                        continue
+                    block.append('<div class="stat-group">')
+                    block.append(f'<span class="stat-group-label">{stat_label}</span>')
+                    block.append('<div class="pill-row">')
+                    for t, prob in thresholds.items():
+                        pct = prob * 100
+                        tier = "pill-hot" if pct >= 70 else ("pill-warm" if pct >= 40 else "pill-cool")
+                        block.append(f'<span class="pill {tier}">{t}+ &middot; {pct:.0f}%</span>')
+                    block.append('</div>')
+                    block.append('</div>')
+                block.append('</div>')
 
         block.append('</section>')
         cards.append("".join(block))
@@ -1033,6 +1684,16 @@ h1 {{
 .pill-cool {{ background: var(--pill-cool-bg); color: var(--pill-cool-text); border: 1px solid var(--pill-cool-border); }}
 .vs-opp-line {{ color: var(--text-dim); font-size: 0.78em; margin: 8px 0 0; line-height: 1.6; }}
 .vs-opp-empty {{ font-style: italic; }}
+.why-list {{
+  margin: 8px 20px 4px;
+  padding: 0 0 0 18px;
+  list-style: disc;
+  color: var(--text-dim);
+  font-size: 0.78em;
+  line-height: 1.6;
+}}
+.why-list li {{ margin: 2px 0; }}
+.why-list li.vs-opp-empty {{ list-style: none; margin-left: -18px; font-style: italic; }}
 .empty-state {{
   background: var(--card);
   border: 1px solid var(--card-border);
@@ -1047,7 +1708,7 @@ h1 {{
 <body>
 <h1>MLB Daily Probabilities</h1>
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
-<p class="disclaimer">Estimates only, not guarantees. Verify actual lines at your sportsbook before betting. K probabilities are adjusted for opponent team strikeout tendency, park strikeout factor, and pitcher fatigue. Spread probabilities blend season-long team run differential with the probable starter's last-5-start ERA and fatigue status, adjusted for park run factor. Pitcher-vs-lineup matchup reads use the confirmed starting lineup when posted; earlier in the day this is unavailable. Park factors: {PARK_FACTOR_SOURCE}. Treat all outputs as directional, not precise - a single-game result can miss even a well-calibrated probability, which is expected variance, not necessarily a broken model.</p>
+<p class="disclaimer">Estimates only, not guarantees. Verify actual lines at your sportsbook before betting. None of the dampening/blend constants in this model (park scaling, fatigue penalty, opponent-K adjustment, weather nudge, spread weights) have been backtested against settled results yet - they are disclosed, directional guesses, not fitted numbers. K probabilities factor in opponent team strikeout tendency (recent-game trend when available, else season), that opponent's league rank among today's teams, park strikeout factor, day-of weather, pitcher fatigue, and a heuristic recent-IL-activation flag (verify actual injury status independently). Spread probabilities blend season-long team run differential, each team's last-~12-game scoring trend, the probable starter's last-5-start ERA and fatigue status, a whole-staff ERA proxy standing in for bullpen quality (no clean bullpen-only split is available from this free data source), park run factor, and day-of weather. Umpire tendency is a known gap - no reliable free source was found for pre-game umpire assignments, so it is not factored in. Batter props (hits/HR/RBI/total bases) only appear once a team's starting lineup is confirmed by MLB, typically 1-3 hours before first pitch; earlier in the day these are simply absent for that team, not broken. Batter floors are empirical (recent-game hit rate per threshold), and the opposing-pitcher matchup note uses that pitcher's season-long K rate against the batter's handedness, not a live scouting read. Pitcher-vs-lineup matchup reads use the confirmed starting lineup when posted; earlier in the day this is unavailable. Park factors: {PARK_FACTOR_SOURCE}. Weather: Open-Meteo forecast, unavailable for dome parks. Treat all outputs as directional, not precise - a single-game result can miss even a well-calibrated probability, which is expected variance, not necessarily a broken model.</p>
 {_render_empty_state() if not cards else ''.join(cards)}
 </body>
 </html>"""
