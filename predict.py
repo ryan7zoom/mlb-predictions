@@ -536,11 +536,30 @@ def get_pitcher_recent_strikeouts(pitcher_id, season=None, last_n=12):
     return k_list
 
 
-def strikeout_floor_probs(k_list, thresholds=(3, 4, 5, 6)):
-    """Empirical probability of hitting each K threshold, based on recent starts."""
+def strikeout_floor_probs(k_list, thresholds=None):
+    """
+    Empirical probability of hitting each K threshold, based on recent starts.
+
+    Real sportsbook strikeout lines sit close to a pitcher's actual median
+    output, not a trivially low floor - a starter averaging 8-9 K/start
+    typically gets a line of 6.5 or 7.5, not 3+ or 4+. If thresholds isn't
+    given explicitly, build a pitcher-specific band centered on his own
+    recent average so the "floor" we surface is one a book would plausibly
+    post, instead of always the same fixed (3,4,5,6) - trivial for high-K
+    arms and unhelpful for a low-K one who'd actually be tested lower.
+    """
     n = len(k_list)
     if n == 0:
         return {}
+    if thresholds is None:
+        avg = statistics.mean(k_list)
+        # Center on round(avg): typical lines run from ~2 below to ~1 above
+        # a pitcher's recent average, e.g. a 6.8 K/start arm gets tested at
+        # 5,6,7,8 rather than a blanket 3,4,5,6.
+        center = max(2, round(avg))
+        thresholds = tuple(sorted(set(
+            t for t in range(center - 2, center + 2) if t >= 1
+        )))
     probs = {}
     for t in thresholds:
         hits = sum(1 for k in k_list if k >= t)
@@ -1400,7 +1419,7 @@ def _render_empty_state():
     </div>"""
 
 
-CONFIDENCE_THRESHOLD = 0.80  # only picks at/above this become eligible for Top Picks
+CONFIDENCE_THRESHOLD = 0.75  # only picks at/above this become eligible for Top Picks
 TOP_PICKS_LIMIT = 8
 
 
