@@ -1380,7 +1380,165 @@ def _render_empty_state():
     </div>"""
 
 
+CONFIDENCE_THRESHOLD = 0.80  # only picks at/above this become eligible for Top Picks
+TOP_PICKS_LIMIT = 8
+
+
+def _lowest_safe_threshold(prob_dict, min_confidence=CONFIDENCE_THRESHOLD):
+    """
+    Given {threshold: probability}, finds the LOWEST threshold whose
+    probability still clears min_confidence - i.e. the most conservative
+    line that's still basically a lock, not just whichever number happens
+    to be highest. A pitcher who hits 6+ K 90% of the time and 4+ K 99% of
+    the time should surface as "4+ K, 99%" here, not "6+ K, 90%" - the
+    safer floor, not the flashier one.
+    """
+    if not prob_dict:
+        return None
+    eligible = [(t, p) for t, p in prob_dict.items() if p is not None and p >= min_confidence]
+    if not eligible:
+        return None
+    # lowest threshold among those that clear the bar
+    t, p = min(eligible, key=lambda x: x[0])
+    return {"threshold": t, "prob": p}
+
+
+def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PICKS_LIMIT):
+    """
+    Scans every game already computed for the day and pulls the single
+    safest, highest-probability line for each pitcher (strikeouts), each
+    batter (hits/HR/RBI/total bases), and each team (spread cover) -
+    using the LOWEST threshold that still clears min_confidence, not just
+    the highest raw percentage on the board. Sorted by probability,
+    highest first, capped at `limit`.
+
+    This reflects the model's own math only - it has not been backtested
+    against real settled results, so "safe" here means "the model is very
+    consistent about this," not "guaranteed to hit." Framed that way in
+    the UI, not hidden.
+    """
+    picks = []
+
+    for g in report:
+        # --- pitcher strikeout floors ---
+        for p in g.get("pitchers", []):
+            best = _lowest_safe_threshold(p.get("floor_probabilities_final"), min_confidence)
+            if best:
+                reasons = []
+                if p.get("recent_k_values"):
+                    avg_k = round(sum(p["recent_k_values"]) / len(p["recent_k_values"]), 1)
+                    reasons.append(f"averaging {avg_k} strikeouts over his last {len(p['recent_k_values'])} starts")
+                if p.get("opponent_k_per_game"):
+                    trend_word = "lately" if p.get("opponent_k_source", "").startswith("recent") else "this season"
+                    reasons.append(f"{p['opponent']} strikes out {p['opponent_k_per_game']}/game {trend_word} "
+                                   f"(league average {p['league_avg_k_per_game']})")
+                picks.append({
+                    "type": "Strikeouts",
+                    "player": p["name"],
+                    "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                    "pick_label": f'{best["threshold"]}+ strikeouts',
+                    "prob": best["prob"],
+                    "reasons": reasons,
+                })
+
+        # --- batter props ---
+        for b in g.get("batter_props", []):
+            floors = b.get("floor_probabilities") or {}
+            stat_labels = {"hits": "hits", "home_runs": "home runs", "rbi": "RBIs", "total_bases": "total bases"}
+            for stat_key, stat_label in stat_labels.items():
+                best = _lowest_safe_threshold(floors.get(stat_key), min_confidence)
+                if best:
+                    reasons = [f"hit this mark in {round(best['prob']*100)}% of his last {b['games_sampled']} games"]
+                    matchup = b.get("opponent_pitcher_matchup")
+                    if matchup:
+                        reasons.append(f"tonight's opposing pitcher has struggled against hitters like him "
+                                       f"({matchup['pitcher_k_rate_vs_this_handedness']*100:.0f}% strikeout rate faced)")
+                    picks.append({
+                        "type": stat_label.capitalize(),
+                        "player": b["name"],
+                        "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                        "pick_label": f'{best["threshold"]}+ {stat_label}',
+                        "prob": best["prob"],
+                        "reasons": reasons,
+                    })
+
+        # --- team spread covers ---
+        for s in g.get("spread_lines", []):
+            for side_label, prob in ((g["away_team"], s.get("away_cover_prob")),
+                                      (g["home_team"], s.get("home_cover_prob"))):
+                if prob is not None and prob >= min_confidence:
+                    picks.append({
+                        "type": "Spread",
+                        "player": side_label,
+                        "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                        "pick_label": f'{s["spread"]:+} spread',
+                        "prob": prob,
+                        "reasons": [f"model favors {side_label} to cover {s['spread']:+} tonight"],
+                    })
+
+    # For spreads, multiple thresholds can trip for the same team - keep only
+    # the single best (lowest-risk / highest-prob) spread line per team per game
+    # rather than cluttering the list with several near-duplicate spread picks.
+    best_spread_per_team = {}
+    other_picks = []
+    for pk in picks:
+        if pk["type"] == "Spread":
+            key = (pk["team_context"], pk["player"])
+            if key not in best_spread_per_team or pk["prob"] > best_spread_per_team[key]["prob"]:
+                best_spread_per_team[key] = pk
+        else:
+            other_picks.append(pk)
+
+    final_picks = other_picks + list(best_spread_per_team.values())
+    final_picks.sort(key=lambda x: x["prob"], reverse=True)
+    return final_picks[:limit]
+
+
+def _render_top_picks(picks):
+    """
+    Renders the Top Picks section: the model's safest, most consistent
+    lines for the day, one per player/team, sorted by probability. Empty
+    state shown honestly if nothing cleared the confidence bar today -
+    that's a normal outcome on a day with tough matchups, not a bug.
+    """
+    if not picks:
+        return """
+    <section class="top-picks">
+      <h2 class="top-picks-title">Today's Top Picks</h2>
+      <p class="top-picks-sub">Nothing cleared our confidence bar today - that happens on days with tougher matchups. Check the full game breakdowns below instead.</p>
+    </section>"""
+
+    rows = []
+    for pk in picks:
+        pct = pk["prob"] * 100
+        reasons_html = ""
+        if pk.get("reasons"):
+            reasons_html = '<ul class="pick-reasons">' + "".join(f"<li>{r}</li>" for r in pk["reasons"]) + "</ul>"
+        rows.append(f"""
+        <div class="pick-card">
+          <div class="pick-card-top">
+            <span class="pick-type">{pk["type"]}</span>
+            <span class="pick-prob">{pct:.0f}%</span>
+          </div>
+          <p class="pick-player">{pk["player"]}</p>
+          <p class="pick-line">{pk["pick_label"]}</p>
+          <p class="pick-context">{pk["team_context"]}</p>
+          {reasons_html}
+        </div>""")
+
+    return f"""
+    <section class="top-picks">
+      <h2 class="top-picks-title">Today's Top Picks</h2>
+      <p class="top-picks-sub">The model's most consistent lines today, safest first. This reflects the model's own math, not a guarantee - always double-check before betting.</p>
+      <div class="pick-grid">
+        {''.join(rows)}
+      </div>
+    </section>"""
+
+
 def render_html(report):
+    top_picks = extract_top_picks(report)
+    top_picks_html = _render_top_picks(top_picks)
     cards = []
     for g in report:
         block = []
@@ -1533,29 +1691,29 @@ def render_html(report):
 :root {{
   --bg: #0B1120;
   --card: #131B2E;
-  --card-border: #1F2A44;
+  --card-border: #2A3752;
   --orange: #E8630A;
   --teal: #2DD4BF;
   --amber: #F5A623;
-  --text: #F1F3F5;
-  --text-dim: #8B96AC;
+  --text: #F7F8FA;
+  --text-dim: #AEB8CC;
   --h1-accent: #ffb35c;
-  --disclaimer-text: #C97B7B;
+  --disclaimer-text: #E39A9A;
   --disclaimer-bg: rgba(232, 99, 10, 0.08);
   --disclaimer-border: rgba(232, 99, 10, 0.2);
-  --flag-bg: rgba(245, 166, 35, 0.1);
-  --flag-border: rgba(245, 166, 35, 0.3);
+  --flag-bg: rgba(245, 166, 35, 0.12);
+  --flag-border: rgba(245, 166, 35, 0.35);
   --row-tint: rgba(255,255,255,0.02);
-  --track-bg: rgba(255,255,255,0.06);
+  --track-bg: rgba(255,255,255,0.08);
   --pill-hot-bg: rgba(45, 212, 191, 0.16);
   --pill-hot-text: #5eead4;
   --pill-hot-border: rgba(45, 212, 191, 0.4);
   --pill-warm-bg: rgba(232, 99, 10, 0.16);
   --pill-warm-text: #ffab6b;
   --pill-warm-border: rgba(232, 99, 10, 0.4);
-  --pill-cool-bg: rgba(255,255,255,0.03);
-  --pill-cool-text: #5b6579;
-  --pill-cool-border: rgba(255,255,255,0.06);
+  --pill-cool-bg: rgba(255,255,255,0.04);
+  --pill-cool-text: #9AA5BC;
+  --pill-cool-border: rgba(255,255,255,0.10);
 }}
 @media (prefers-color-scheme: light) {{
   :root {{
@@ -1671,9 +1829,9 @@ h1 {{
   padding: 10px 12px 12px;
 }}
 .spread-num {{ display: block; font-weight: 700; font-size: 0.85em; color: var(--text-dim); margin-bottom: 8px; }}
-.pbar-row {{ display: flex; align-items: center; gap: 8px; margin: 6px 0; }}
-.pbar-label {{ width: 34px; font-size: 0.78em; color: var(--text-dim); font-weight: 600; flex-shrink: 0; }}
-.pbar-track {{ flex: 1; height: 8px; background: var(--track-bg); border-radius: 4px; overflow: hidden; }}
+.pbar-row {{ display: flex; align-items: center; gap: 10px; margin: 10px 0; }}
+.pbar-label {{ width: 84px; font-size: 0.78em; color: var(--text-dim); font-weight: 600; flex-shrink: 0; line-height: 1.25; }}
+.pbar-track {{ flex: 1; height: 8px; background: var(--track-bg); border-radius: 4px; overflow: hidden; min-width: 0; }}
 .pbar-fill {{ height: 100%; border-radius: 4px; }}
 .pbar-na {{ width: 0%; }}
 .pbar-value {{ width: 38px; text-align: right; font-size: 0.82em; font-weight: 700; flex-shrink: 0; color: var(--text); }}
@@ -1713,12 +1871,50 @@ h1 {{
 }}
 .empty-state-title {{ font-size: 1.15em; font-weight: 700; color: var(--text); margin: 0 0 8px; }}
 .empty-state-sub {{ color: var(--text-dim); font-size: 0.85em; line-height: 1.6; margin: 0; }}
+.top-picks {{
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  padding: 20px 18px;
+  margin-bottom: 22px;
+}}
+.top-picks-title {{ font-size: 1.1em; font-weight: 800; margin: 0 0 4px; color: var(--text); }}
+.top-picks-sub {{ font-size: 0.78em; color: var(--text-dim); line-height: 1.5; margin: 0 0 14px; }}
+.pick-grid {{ display: flex; flex-direction: column; gap: 10px; }}
+.pick-card {{
+  background: var(--track-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}}
+.pick-card-top {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }}
+.pick-type {{
+  font-size: 0.68em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}}
+.pick-prob {{ font-size: 1.1em; font-weight: 800; color: var(--teal); }}
+.pick-player {{ font-size: 0.98em; font-weight: 700; color: var(--text); margin: 0 0 2px; }}
+.pick-line {{ font-size: 0.88em; font-weight: 600; color: var(--orange); margin: 0 0 2px; }}
+.pick-context {{ font-size: 0.75em; color: var(--text-dim); margin: 0; }}
+.pick-reasons {{
+  margin: 8px 0 0;
+  padding: 0 0 0 16px;
+  list-style: disc;
+  font-size: 0.75em;
+  color: var(--text-dim);
+  line-height: 1.5;
+}}
+.pick-reasons li {{ margin: 2px 0; }}
 </style>
 </head>
 <body>
 <h1>MLB Daily Probabilities</h1>
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
 <p class="disclaimer">These are estimates, not guarantees — always double-check the actual odds at your sportsbook before betting. Numbers are directional (best-effort predictions), not scientifically proven locks.</p>
+{top_picks_html}
 {_render_empty_state() if not cards else ''.join(cards)}
 </body>
 </html>"""
