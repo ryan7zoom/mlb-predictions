@@ -953,6 +953,51 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
     return round(prob, 3)
 
 
+def yrfi_nrfi_prob(pitcher_a_form, pitcher_b_form, team_a_stats, team_b_stats,
+                    park_run_factor=100, league_avg_era=4.20):
+    """
+    Estimate P(a run scores in the 1st inning by either team) - the
+    "YRFI" (yes) market; NRFI is just 1 - this.
+
+    Approach: treat each starter's runs-per-9-innings rate as a Poisson
+    rate, scale it down to a single inning (divide by 9), and use the
+    Poisson formula P(at least 1 run) = 1 - e^(-lambda) for each starter
+    facing the opposing lineup in the top/bottom of the 1st. Combine the
+    two independent half-innings: P(no run either half) = (1-p_a)(1-p_b),
+    so P(YRFI) = 1 - (1-p_a)(1-p_b).
+
+    lambda per starter blends his recent-start ERA (70%) with the
+    opposing team's season run-scoring rate (30%) when both are
+    available, so a soft-tossing starter facing a weak lineup gets pulled
+    toward NRFI and vice versa. Falls back to league_avg_era if recent
+    form is missing (e.g. early season / call-up with <3 starts sampled).
+
+    This is a simplification - real first-inning scoring also depends on
+    who's actually due up (leadoff hitters specifically), which this
+    model doesn't have lineup-order data for yet. Treat as directional,
+    same as the rest of this file's props.
+    """
+    def starter_first_inning_lambda(pitcher_form, opp_team_stats):
+        era = league_avg_era
+        if pitcher_form and pitcher_form.get("starts_sampled", 0) >= 3:
+            era = pitcher_form["recent_era"]
+        per_inning = era / 9
+        if opp_team_stats and opp_team_stats.get("runs_scored_pg") is not None:
+            opp_per_inning = opp_team_stats["runs_scored_pg"] / 9
+            per_inning = per_inning * 0.7 + opp_per_inning * 0.3
+        park_scale = park_run_factor / 100  # linear here - single inning, small effect either way
+        return max(per_inning * park_scale, 0.01)
+
+    lam_a = starter_first_inning_lambda(pitcher_a_form, team_b_stats)  # team A's starter faces team B's lineup
+    lam_b = starter_first_inning_lambda(pitcher_b_form, team_a_stats)  # team B's starter faces team A's lineup
+
+    p_a_scores = 1 - math.exp(-lam_a)
+    p_b_scores = 1 - math.exp(-lam_b)
+    p_yrfi = 1 - (1 - p_a_scores) * (1 - p_b_scores)
+    return round(p_yrfi, 3)
+
+
+
 # ---------- batter props ----------
 # Section D: batter prop floors (hits, HR, RBI, total bases), opponent
 # pitcher matchup context, home/away splits, recent-return-from-injury
@@ -1363,6 +1408,19 @@ def build_report():
         )
         entry["moneyline"] = {"away_win_prob": ml_away, "home_win_prob": ml_home}
 
+        # YRFI/NRFI: independent of the spread model above (single-inning
+        # Poisson approach, not the full-game normal approximation), using
+        # the same starter-form and team-offense inputs already fetched.
+        p_yrfi = yrfi_nrfi_prob(
+            away_pitcher_form, home_pitcher_form, away_stats, home_stats,
+            park_run_factor=park_r_factor,
+        )
+        entry["yrfi_nrfi"] = {
+            "yrfi_prob": p_yrfi,
+            "nrfi_prob": round(1 - p_yrfi, 3) if p_yrfi is not None else None,
+        } if p_yrfi is not None else None
+
+
         entry["away_pitcher_form"] = away_pitcher_form
         entry["home_pitcher_form"] = home_pitcher_form
         entry["away_recent_trend"] = away_recent
@@ -1546,6 +1604,23 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                         "reasons": [f"model favors {side_label} to win outright tonight"],
                     })
 
+        # --- YRFI / NRFI (run in the 1st inning, yes or no) ---
+        yn = g.get("yrfi_nrfi")
+        if yn:
+            for label, key in (("YRFI", "yrfi_prob"), ("NRFI", "nrfi_prob")):
+                prob = yn.get(key)
+                if prob is not None and prob >= min_confidence:
+                    game_picks.append({
+                        "type": "1st Inning",
+                        "player": matchup,
+                        "team_context": matchup,
+                        "pick_label": label,
+                        "prob": prob,
+                        "reasons": [f"model favors {label} ({'a run scores' if label == 'YRFI' else 'no run scores'} "
+                                    f"in the 1st) tonight"],
+                    })
+
+
         # Bed builder requirement: need 2+ picks from this game, or it's not
         # useful for combining legs - drop games with only 0 or 1 qualifying pick.
         if len(game_picks) >= 2:
@@ -1635,6 +1710,16 @@ def render_html(report):
             block.append(_prob_bar(g["home_team"], s["home_cover_prob"], "var(--orange)"))
             block.append('</div>')
         block.append('</div>')
+
+        yn = g.get("yrfi_nrfi")
+        if yn and yn.get("yrfi_prob") is not None:
+            block.append('<h3 class="section-label">1st Inning (YRFI / NRFI)</h3>')
+            block.append('<div class="spread-block">')
+            block.append('<div class="spread-row-group">')
+            block.append(_prob_bar("YRFI (run scores)", yn["yrfi_prob"], "var(--teal)"))
+            block.append(_prob_bar("NRFI (no run)", yn["nrfi_prob"], "var(--orange)"))
+            block.append('</div>')
+            block.append('</div>')
 
         block.append('<ul class="why-list">')
         for label, recent, bullpen, form in (
