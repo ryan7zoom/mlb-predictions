@@ -1200,7 +1200,8 @@ def build_report():
             "park_factor": park,
             "park_description": describe_park_factor(park),
             "pitchers": [],
-            "spread_lines": []
+            "spread_lines": [],
+            "moneyline": None
         }
 
         for side, pid, pname, opp_id, opp_name in [
@@ -1324,6 +1325,25 @@ def build_report():
                 "home_cover_prob": p_home
             })
 
+        # Moneyline (straight-up win prob): same run-differential model,
+        # just evaluated at spread=0 instead of a run line. Same disclosed,
+        # unfitted-weights caveat as the spread model above applies here too.
+        ml_away = spread_cover_prob(
+            away_stats, home_stats, 0, park_run_factor=park_r_factor,
+            pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
+            pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
+            team_a_recent=away_recent, team_b_recent=home_recent,
+            bullpen_a=away_bullpen, bullpen_b=home_bullpen, weather_a=game_weather,
+        )
+        ml_home = spread_cover_prob(
+            home_stats, away_stats, 0, park_run_factor=park_r_factor,
+            pitcher_a_form=home_pitcher_form, pitcher_b_form=away_pitcher_form,
+            pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue,
+            team_a_recent=home_recent, team_b_recent=away_recent,
+            bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
+        )
+        entry["moneyline"] = {"away_win_prob": ml_away, "home_win_prob": ml_home}
+
         entry["away_pitcher_form"] = away_pitcher_form
         entry["home_pitcher_form"] = home_pitcher_form
         entry["away_recent_trend"] = away_recent
@@ -1405,21 +1425,32 @@ def _lowest_safe_threshold(prob_dict, min_confidence=CONFIDENCE_THRESHOLD):
 
 def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PICKS_LIMIT):
     """
-    Scans every game already computed for the day and pulls the single
-    safest, highest-probability line for each pitcher (strikeouts), each
-    batter (hits/HR/RBI/total bases), and each team (spread cover) -
-    using the LOWEST threshold that still clears min_confidence, not just
-    the highest raw percentage on the board. Sorted by probability,
-    highest first, capped at `limit`.
+    Scans every game already computed for the day and pulls every pick
+    (pitcher strikeouts, batter props, team spread cover, moneyline) that
+    clears min_confidence, using the LOWEST threshold that still clears the
+    bar for floor-style props (not just the highest raw percentage on the
+    board). Picks are grouped by game, and a game is only included in the
+    output if it has AT LEAST 2 QUALIFYING PICKS - the point of this
+    section is bet builders (a.k.a. same-game parlays), which need 2+ legs
+    from the same game to combine. A single strong pick with no partner in
+    its own game doesn't help with that, so it's dropped rather than shown
+    as an island.
 
     This reflects the model's own math only - it has not been backtested
     against real settled results, so "safe" here means "the model is very
     consistent about this," not "guaranteed to hit." Framed that way in
     the UI, not hidden.
+
+    Returns a list of game-groups: [{"matchup": ..., "picks": [...]}, ...],
+    sorted by each game's best single pick probability, highest first, and
+    capped at `limit` games (not `limit` picks).
     """
-    picks = []
+    games = []
 
     for g in report:
+        matchup = f'{g["away_team"]} @ {g["home_team"]}'
+        game_picks = []
+
         # --- pitcher strikeout floors ---
         for p in g.get("pitchers", []):
             best = _lowest_safe_threshold(p.get("floor_probabilities_final"), min_confidence)
@@ -1432,10 +1463,10 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                     trend_word = "lately" if p.get("opponent_k_source", "").startswith("recent") else "this season"
                     reasons.append(f"{p['opponent']} strikes out {p['opponent_k_per_game']}/game {trend_word} "
                                    f"(league average {p['league_avg_k_per_game']})")
-                picks.append({
+                game_picks.append({
                     "type": "Strikeouts",
                     "player": p["name"],
-                    "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                    "team_context": matchup,
                     "pick_label": f'{best["threshold"]}+ strikeouts',
                     "prob": best["prob"],
                     "reasons": reasons,
@@ -1449,90 +1480,116 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                 best = _lowest_safe_threshold(floors.get(stat_key), min_confidence)
                 if best:
                     reasons = [f"hit this mark in {round(best['prob']*100)}% of his last {b['games_sampled']} games"]
-                    matchup = b.get("opponent_pitcher_matchup")
-                    if matchup:
+                    matchup_info = b.get("opponent_pitcher_matchup")
+                    if matchup_info:
                         reasons.append(f"tonight's opposing pitcher has struggled against hitters like him "
-                                       f"({matchup['pitcher_k_rate_vs_this_handedness']*100:.0f}% strikeout rate faced)")
-                    picks.append({
+                                       f"({matchup_info['pitcher_k_rate_vs_this_handedness']*100:.0f}% strikeout rate faced)")
+                    game_picks.append({
                         "type": stat_label.capitalize(),
                         "player": b["name"],
-                        "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                        "team_context": matchup,
                         "pick_label": f'{best["threshold"]}+ {stat_label}',
                         "prob": best["prob"],
                         "reasons": reasons,
                     })
 
-        # --- team spread covers ---
+        # --- team spread covers (best line per team, not every threshold) ---
+        best_spread_per_team = {}
         for s in g.get("spread_lines", []):
             for side_label, prob in ((g["away_team"], s.get("away_cover_prob")),
                                       (g["home_team"], s.get("home_cover_prob"))):
                 if prob is not None and prob >= min_confidence:
-                    picks.append({
+                    key = side_label
+                    candidate = {
                         "type": "Spread",
                         "player": side_label,
-                        "team_context": f'{g["away_team"]} @ {g["home_team"]}',
+                        "team_context": matchup,
                         "pick_label": f'{s["spread"]:+} spread',
                         "prob": prob,
                         "reasons": [f"model favors {side_label} to cover {s['spread']:+} tonight"],
+                    }
+                    if key not in best_spread_per_team or prob > best_spread_per_team[key]["prob"]:
+                        best_spread_per_team[key] = candidate
+        game_picks.extend(best_spread_per_team.values())
+
+        # --- moneyline (straight-up win) ---
+        ml = g.get("moneyline")
+        if ml:
+            for side_label, prob in ((g["away_team"], ml.get("away_win_prob")),
+                                      (g["home_team"], ml.get("home_win_prob"))):
+                if prob is not None and prob >= min_confidence:
+                    game_picks.append({
+                        "type": "Moneyline",
+                        "player": side_label,
+                        "team_context": matchup,
+                        "pick_label": f'{side_label} to win',
+                        "prob": prob,
+                        "reasons": [f"model favors {side_label} to win outright tonight"],
                     })
 
-    # For spreads, multiple thresholds can trip for the same team - keep only
-    # the single best (lowest-risk / highest-prob) spread line per team per game
-    # rather than cluttering the list with several near-duplicate spread picks.
-    best_spread_per_team = {}
-    other_picks = []
-    for pk in picks:
-        if pk["type"] == "Spread":
-            key = (pk["team_context"], pk["player"])
-            if key not in best_spread_per_team or pk["prob"] > best_spread_per_team[key]["prob"]:
-                best_spread_per_team[key] = pk
-        else:
-            other_picks.append(pk)
+        # Bed builder requirement: need 2+ picks from this game, or it's not
+        # useful for combining legs - drop games with only 0 or 1 qualifying pick.
+        if len(game_picks) >= 2:
+            game_picks.sort(key=lambda x: x["prob"], reverse=True)
+            games.append({
+                "matchup": matchup,
+                "best_prob": game_picks[0]["prob"],
+                "picks": game_picks,
+            })
 
-    final_picks = other_picks + list(best_spread_per_team.values())
-    final_picks.sort(key=lambda x: x["prob"], reverse=True)
-    return final_picks[:limit]
+    games.sort(key=lambda x: x["best_prob"], reverse=True)
+    return games[:limit]
 
 
-def _render_top_picks(picks):
+def _render_top_picks(games):
     """
-    Renders the Top Picks section: the model's safest, most consistent
-    lines for the day, one per player/team, sorted by probability. Empty
-    state shown honestly if nothing cleared the confidence bar today -
-    that's a normal outcome on a day with tough matchups, not a bug.
+    Renders the Top Picks section as bet-builder groups: one block per
+    game, each containing 2+ qualifying picks (any mix of moneyline,
+    spread, pitcher props, batter props) that can be combined into a
+    same-game parlay / bet builder. Games sorted by their best single
+    pick's probability, highest first. Empty state shown honestly if no
+    game had 2+ qualifying picks today - that's a normal outcome on a day
+    with tougher matchups, not a bug.
     """
-    if not picks:
+    if not games:
         return """
     <section class="top-picks">
-      <h2 class="top-picks-title">Today's Top Picks</h2>
-      <p class="top-picks-sub">Nothing cleared our confidence bar today - that happens on days with tougher matchups. Check the full game breakdowns below instead.</p>
+      <h2 class="top-picks-title">today's bet builders</h2>
+      <p class="top-picks-sub">No game had at least two picks clear our confidence bar today - that happens on days with tougher matchups. Check the full game breakdowns below instead.</p>
     </section>"""
 
-    rows = []
-    for pk in picks:
-        pct = pk["prob"] * 100
-        reasons_html = ""
-        if pk.get("reasons"):
-            reasons_html = '<ul class="pick-reasons">' + "".join(f"<li>{r}</li>" for r in pk["reasons"]) + "</ul>"
-        rows.append(f"""
-        <div class="pick-card">
-          <div class="pick-card-top">
-            <span class="pick-type">{pk["type"]}</span>
-            <span class="pick-prob">{pct:.0f}%</span>
-          </div>
-          <p class="pick-player">{pk["player"]}</p>
-          <p class="pick-line">{pk["pick_label"]}</p>
-          <p class="pick-context">{pk["team_context"]}</p>
-          {reasons_html}
-        </div>""")
+    game_blocks = []
+    for game in games:
+        rows = []
+        for pk in game["picks"]:
+            pct = pk["prob"] * 100
+            reasons_html = ""
+            if pk.get("reasons"):
+                reasons_html = '<ul class="pick-reasons">' + "".join(f"<li>{r}</li>" for r in pk["reasons"]) + "</ul>"
+            rows.append(f"""
+          <div class="pick-card">
+            <div class="pick-card-top">
+              <span class="pick-type">{pk["type"]}</span>
+              <span class="pick-prob">{pct:.0f}%</span>
+            </div>
+            <p class="pick-player">{pk["player"]}</p>
+            <p class="pick-line">{pk["pick_label"]}</p>
+            {reasons_html}
+          </div>""")
+
+        game_blocks.append(f"""
+      <div class="bed-builder-group">
+        <h3 class="bed-builder-label">bet builder: {game["matchup"]}</h3>
+        <div class="pick-grid">
+          {''.join(rows)}
+        </div>
+      </div>""")
 
     return f"""
     <section class="top-picks">
-      <h2 class="top-picks-title">Today's Top Picks</h2>
-      <p class="top-picks-sub">The model's most consistent lines today, safest first. This reflects the model's own math, not a guarantee - always double-check before betting.</p>
-      <div class="pick-grid">
-        {''.join(rows)}
-      </div>
+      <h2 class="top-picks-title">today's bet builders</h2>
+      <p class="top-picks-sub">Each group below has 2+ picks from the same game - moneyline, spread, and player props - so you can combine legs into a bet builder / same-game parlay. This reflects the model's own math, not a guarantee - always double-check before betting.</p>
+      {''.join(game_blocks)}
     </section>"""
 
 
@@ -1881,6 +1938,15 @@ h1 {{
 .top-picks-title {{ font-size: 1.1em; font-weight: 800; margin: 0 0 4px; color: var(--text); }}
 .top-picks-sub {{ font-size: 0.78em; color: var(--text-dim); line-height: 1.5; margin: 0 0 14px; }}
 .pick-grid {{ display: flex; flex-direction: column; gap: 10px; }}
+.bed-builder-group {{ margin-bottom: 20px; }}
+.bed-builder-group:last-child {{ margin-bottom: 0; }}
+.bed-builder-label {{
+  font-size: 0.85em;
+  font-weight: 700;
+  text-transform: lowercase;
+  color: var(--teal);
+  margin: 0 0 10px;
+}}
 .pick-card {{
   background: var(--track-bg);
   border: 1px solid var(--card-border);
