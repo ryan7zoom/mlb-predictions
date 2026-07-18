@@ -1691,6 +1691,7 @@ def render_html(report):
     top_picks = extract_top_picks(report)
     top_picks_html = _render_top_picks(top_picks)
     cards = []
+    prop_cards = []
     for g in report:
         block = []
         block.append('<section class="matchup-card">')
@@ -1795,30 +1796,39 @@ def render_html(report):
             block.append('</div>')
             block.append('</div>')
 
+        block.append('</section>')
+        cards.append("".join(block))
+
         batter_props = g.get("batter_props") or []
         if batter_props:
-            block.append('<h3 class="section-label">Player Props</h3>')
+            prop_block = []
+            prop_block.append('<section class="matchup-card">')
+            prop_block.append('<div class="matchup-header">')
+            prop_block.append('<div class="court-line"></div>')
+            prop_block.append(f'<h2>{g["away_team"]} <span class="at-sign">@</span> {g["home_team"]}</h2>')
+            prop_block.append('</div>')
+            prop_block.append('<h3 class="section-label">Player Props</h3>')
             for b in batter_props:
                 side_label = g["away_team"] if b["side"] == "away" else g["home_team"]
                 hand_word = {"L": "left-handed", "R": "right-handed", "S": "switch-hitter"}.get(b.get("bat_side"), "")
                 hand_txt = f' &middot; {hand_word}' if hand_word else ''
-                block.append('<div class="player-block">')
-                block.append(f'<p class="player-name">{b["name"]} <span class="games-sampled">'
+                prop_block.append('<div class="player-block">')
+                prop_block.append(f'<p class="player-name">{b["name"]} <span class="games-sampled">'
                              f'{side_label}{hand_txt} &middot; last {b["games_sampled"]} games</span></p>')
 
                 il_check = b.get("il_check")
                 if il_check and il_check.get("flag"):
-                    block.append(f'<div class="flag-chip flag-chip-inline">&#9888; This player may be recently back '
+                    prop_block.append(f'<div class="flag-chip flag-chip-inline">&#9888; This player may be recently back '
                                  f'from an injury or a long break - worth double-checking before betting on him.</div>')
 
                 matchup = b.get("opponent_pitcher_matchup")
                 if matchup:
-                    block.append(f'<p class="vs-opp-line">Tonight\'s opposing pitcher strikes out batters like him '
+                    prop_block.append(f'<p class="vs-opp-line">Tonight\'s opposing pitcher strikes out batters like him '
                                  f'{matchup["pitcher_k_rate_vs_this_handedness"]*100:.0f}% of the time faced this season</p>')
 
                 splits = b.get("home_away_split")
                 if splits and splits.get("home_hits_per_game") is not None and splits.get("away_hits_per_game") is not None:
-                    block.append(f'<p class="vs-opp-line">Hits/game: {splits["home_hits_per_game"]} at home '
+                    prop_block.append(f'<p class="vs-opp-line">Hits/game: {splits["home_hits_per_game"]} at home '
                                  f'({splits["home_games_sampled"]} gm) &middot; {splits["away_hits_per_game"]} away '
                                  f'({splits["away_games_sampled"]} gm)</p>')
 
@@ -1828,19 +1838,18 @@ def render_html(report):
                     thresholds = floors.get(stat_key)
                     if not thresholds:
                         continue
-                    block.append('<div class="stat-group">')
-                    block.append(f'<span class="stat-group-label">{stat_label}</span>')
-                    block.append('<div class="pill-row">')
+                    prop_block.append('<div class="stat-group">')
+                    prop_block.append(f'<span class="stat-group-label">{stat_label}</span>')
+                    prop_block.append('<div class="pill-row">')
                     for t, prob in thresholds.items():
                         pct = prob * 100
                         tier = "pill-hot" if pct >= 70 else ("pill-warm" if pct >= 40 else "pill-cool")
-                        block.append(f'<span class="pill {tier}">{t}+ &middot; {pct:.0f}%</span>')
-                    block.append('</div>')
-                    block.append('</div>')
-                block.append('</div>')
-
-        block.append('</section>')
-        cards.append("".join(block))
+                        prop_block.append(f'<span class="pill {tier}">{t}+ &middot; {pct:.0f}%</span>')
+                    prop_block.append('</div>')
+                    prop_block.append('</div>')
+                prop_block.append('</div>')
+            prop_block.append('</section>')
+            prop_cards.append("".join(prop_block))
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -2078,14 +2087,87 @@ h1 {{
   line-height: 1.5;
 }}
 .pick-reasons li {{ margin: 2px 0; }}
+
+.tab-nav {{
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  padding: 0 20px;
+  margin: 18px 0 4px;
+}}
+.tab-card {{
+  background: var(--card, #131B2E);
+  border: 1px solid var(--card-border, rgba(255,255,255,0.08));
+  border-radius: 12px;
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text, #F7F8FA);
+}}
+.tab-card-title {{
+  font-size: 0.95em;
+  font-weight: 800;
+}}
+.tab-card-sub {{
+  font-size: 0.68em;
+  color: var(--text-dim, #AEB8CC);
+  line-height: 1.3;
+}}
+.tab-card.active {{
+  border-color: var(--teal, #2DD4BF);
+  background: rgba(45, 212, 191, 0.08);
+}}
+.tab-card.active .tab-card-title {{ color: var(--teal, #2DD4BF); }}
+.tab-panel {{ display: none; }}
+.tab-panel.active {{ display: block; }}
 </style>
 </head>
 <body>
 <h1>MLB Daily Probabilities</h1>
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
 <p class="disclaimer">These are estimates, not guarantees — always double-check the actual odds at your sportsbook before betting. Numbers are directional (best-effort predictions), not scientifically proven locks.</p>
+
+<div class="tab-nav">
+  <button class="tab-card active" data-tab="tab-builders" onclick="showTab('tab-builders', this)">
+    <span class="tab-card-title">Bet Builders</span>
+    <span class="tab-card-sub">Same-game parlay picks</span>
+  </button>
+  <button class="tab-card" data-tab="tab-pitching" onclick="showTab('tab-pitching', this)">
+    <span class="tab-card-title">Game Lines &amp; Pitchers</span>
+    <span class="tab-card-sub">Spreads, YRFI/NRFI, starting pitchers</span>
+  </button>
+  <button class="tab-card" data-tab="tab-props" onclick="showTab('tab-props', this)">
+    <span class="tab-card-title">Player Props</span>
+    <span class="tab-card-sub">Hits, HR, RBI, total bases</span>
+  </button>
+</div>
+
+<div id="tab-builders" class="tab-panel active">
 {top_picks_html}
+</div>
+
+<div id="tab-pitching" class="tab-panel">
 {_render_empty_state() if not cards else ''.join(cards)}
+</div>
+
+<div id="tab-props" class="tab-panel">
+{''.join(prop_cards) if prop_cards else '<p class="disclaimer">No player prop data available today.</p>'}
+</div>
+
+<script>
+function showTab(id, btn) {{
+  document.querySelectorAll('.tab-panel').forEach(function(p) {{ p.classList.remove('active'); }});
+  document.querySelectorAll('.tab-card').forEach(function(c) {{ c.classList.remove('active'); }});
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  window.scrollTo({{ top: 0, behavior: 'instant' }});
+}}
+</script>
 </body>
 </html>"""
     return html
