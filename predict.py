@@ -96,6 +96,21 @@ PARK_LOCATIONS = {
 # closed/retractable roof don't match outdoor forecast data, and pretending
 # otherwise would produce a misleading adjustment.
 
+def team_nickname(team_id, fallback_name=None):
+    """
+    Returns the team's nickname (e.g. 'Guardians') instead of the MLB Stats
+    API's full/location-based name (e.g. 'Cleveland Guardians' or
+    'Cleveland'). Uses the PARK_FACTORS table (keyed by team_id) as the
+    source of truth since it already lists nicknames for every team.
+    Falls back to whatever name the API gave us if the id isn't found
+    (e.g. All-Star teams), so nothing breaks on an unmapped id.
+    """
+    entry = PARK_FACTORS.get(team_id)
+    if entry:
+        return entry["team"]
+    return fallback_name
+
+
 # ---------- low-level fetch ----------
 
 def get(path, params=None):
@@ -223,15 +238,17 @@ def get_todays_games(date=None):
 
             away = g["teams"]["away"]
             home = g["teams"]["home"]
+            away_nick = team_nickname(away["team"]["id"], away["team"]["name"])
+            home_nick = team_nickname(home["team"]["id"], home["team"]["name"])
             games.append({
                 "gamePk": g["gamePk"],
-                "away_team": away["team"]["name"],
-                "away_team_short": away["team"].get("shortName") or away["team"]["name"],
-                "away_team_abbr": away["team"].get("abbreviation") or away["team"]["name"][:3].upper(),
+                "away_team": away_nick,
+                "away_team_short": away_nick,
+                "away_team_abbr": away["team"].get("abbreviation") or away_nick[:3].upper(),
                 "away_team_id": away["team"]["id"],
-                "home_team": home["team"]["name"],
-                "home_team_short": home["team"].get("shortName") or home["team"]["name"],
-                "home_team_abbr": home["team"].get("abbreviation") or home["team"]["name"][:3].upper(),
+                "home_team": home_nick,
+                "home_team_short": home_nick,
+                "home_team_abbr": home["team"].get("abbreviation") or home_nick[:3].upper(),
                 "home_team_id": home["team"]["id"],
                 "away_pitcher": away.get("probablePitcher", {}).get("fullName"),
                 "away_pitcher_id": away.get("probablePitcher", {}).get("id"),
