@@ -531,8 +531,13 @@ def describe_park_factor(park_factors):
 
 
 
-def get_pitcher_recent_strikeouts(pitcher_id, season=None, last_n=12):
-    """Return list of strikeout counts from the pitcher's most recent starts."""
+def get_pitcher_start_gamelogs(pitcher_id, season=None, last_n=12):
+    """
+    Single shared gamelog fetch for a starting pitcher's recent starts,
+    returning per-start K count, innings pitched, and earned runs. Both
+    get_pitcher_recent_strikeouts and get_pitcher_k_per_ip derive their
+    lists from this one fetch instead of each hitting the API separately.
+    """
     if season is None:
         season = datetime.utcnow().year
     data = get_safe(f"/people/{pitcher_id}/stats", {
@@ -540,17 +545,136 @@ def get_pitcher_recent_strikeouts(pitcher_id, season=None, last_n=12):
         "group": "pitching",
         "season": season
     })
-    k_list = []
     try:
         splits = data["stats"][0]["splits"]
     except (KeyError, IndexError, TypeError):
         return []
-    # only count actual starts (games started)
-    starts = [s for s in splits if s["stat"].get("gamesStarted", 0) == "1"
-              or s["stat"].get("gamesStarted", 0) == 1]
+    starts = [s for s in splits if s["stat"].get("gamesStarted", 0) in ("1", 1)]
+    out = []
     for s in starts[-last_n:]:
-        k_list.append(int(s["stat"].get("strikeOuts", 0)))
-    return k_list
+        stat = s["stat"]
+        try:
+            ip = float(stat.get("inningsPitched", 0) or 0)
+        except (TypeError, ValueError):
+            ip = 0.0
+        out.append({
+            "date": s.get("date"),
+            "strikeouts": int(stat.get("strikeOuts", 0)),
+            "innings_pitched": ip,
+            "earned_runs": int(stat.get("earnedRuns", 0)),
+        })
+    return out
+
+
+def get_pitcher_recent_strikeouts(pitcher_id, season=None, last_n=12):
+    """Return list of strikeout counts from the pitcher's most recent starts."""
+    logs = get_pitcher_start_gamelogs(pitcher_id, season, last_n)
+    return [g["strikeouts"] for g in logs]
+
+
+def get_pitcher_k_per_ip(pitcher_id, season=None, last_n=12):
+    """
+    Strikeouts-per-inning-pitched rate over the pitcher's last N starts,
+    derived from the same gamelog fetch as get_pitcher_recent_strikeouts
+    (no duplicate API call). Used to sanity-check the K floor against
+    today's likely innings, since a K floor built from a mix of 7-IP and
+    5-IP starts isn't correctly discounted for a start where he's
+    projected for fewer innings.
+    Returns None if fewer than 3 starts have usable innings data.
+    """
+    logs = get_pitcher_start_gamelogs(pitcher_id, season, last_n)
+    usable = [g for g in logs if g["innings_pitched"] > 0]
+    if len(usable) < 3:
+        return None
+    total_k = sum(g["strikeouts"] for g in usable)
+    total_ip = sum(g["innings_pitched"] for g in usable)
+    if total_ip == 0:
+        return None
+    return {
+        "starts_sampled": len(usable),
+        "k_per_ip": round(total_k / total_ip, 3),
+        "avg_ip_per_start": round(total_ip / len(usable), 2),
+    }
+
+
+def discount_k_floor_for_projected_innings(k_probs, k_per_ip_data, projected_innings):
+    """
+    If today's likely innings (from get_pitcher_innings_trend's recent
+    average) are shorter than the innings baseline the K floor was built
+    from (k_per_ip_data's avg_ip_per_start), discount the floor
+    accordingly - a K floor built from 6-IP outings isn't trustworthy
+    as-is for a start projected at 4-5 IP.
+    Small, disclosed, unfitted dampening - same honesty pattern as the
+    rest of this file's adjustments.
+    """
+    if not k_probs or not k_per_ip_data or not projected_innings:
+        return k_probs
+    baseline_ip = k_per_ip_data.get("avg_ip_per_start")
+    if not baseline_ip or baseline_ip <= 0:
+        return k_probs
+    ip_ratio = projected_innings / baseline_ip
+    if ip_ratio >= 1:
+        return k_probs  # today's projected innings aren't shorter than baseline - no discount needed
+    factor = 1 - (1 - ip_ratio) * 0.5  # UNFITTED CONSTANT - dampened, disclosed, not backtested
+    return {t: round(max(0.0, p * factor), 3) for t, p in k_probs.items()}
+
+
+def strikeout_consistency_signal(gamelogs):
+    """
+    Checks whether this pitcher's LOW-earned-run (good) outings tend to
+    also be his high-strikeout outings, or whether he can pitch well
+    without piling up K's (a contact-manager). Simple, explainable check:
+    compares his average K's in his best-ERA half of recent starts vs his
+    worst-ERA half, rather than a full correlation coefficient.
+
+    Returns None if fewer than 4 starts are available (need at least 2 per
+    half to be meaningful). If his best-ERA outings don't come with
+    meaningfully higher K's than his worst-ERA outings, flags it in plain
+    English - a good pitching line today doesn't necessarily mean a K
+    prop hits for this particular pitcher.
+    """
+    usable = [g for g in gamelogs if g["innings_pitched"] > 0]
+    if len(usable) < 4:
+        return None
+    with_era = []
+    for g in usable:
+        era = (g["earned_runs"] / g["innings_pitched"]) * 9
+        with_era.append((era, g["strikeouts"]))
+    with_era.sort(key=lambda x: x[0])  # lowest ERA (best outings) first
+    half = len(with_era) // 2
+    best_half = with_era[:half]
+    worst_half = with_era[half:] if len(with_era) - half >= half else with_era[-half:]
+    best_avg_k = sum(k for _, k in best_half) / len(best_half)
+    worst_avg_k = sum(k for _, k in worst_half) / len(worst_half)
+    # UNFITTED CONSTANT: "meaningfully higher" = at least 1 more K on
+    # average in the good-ERA half - a disclosed, simple cutoff.
+    ks_track_with_good_outings = best_avg_k >= worst_avg_k + 1.0
+    note = None
+    if not ks_track_with_good_outings:
+        note = ("this pitcher's best outings recently haven't come with high strikeout counts - "
+                "a good pitching line today doesn't necessarily mean this K prop hits")
+    return {
+        "best_era_half_avg_k": round(best_avg_k, 2),
+        "worst_era_half_avg_k": round(worst_avg_k, 2),
+        "ks_track_with_good_outings": ks_track_with_good_outings,
+        "note": note,
+    }
+
+
+def dampen_k_floor_for_inconsistency(k_probs, consistency_signal):
+    """
+    Small, disclosed, dampened reduction to K floor probabilities when
+    this pitcher's good outings don't reliably come with strikeouts - the
+    plain-English flag from strikeout_consistency_signal is the primary
+    surface for this, but the floor itself gets a small nudge down too,
+    same pattern as adjust_k_floor_for_opponent. UNFITTED CONSTANT: 0.95,
+    a small disclosed guess, not backtested.
+    """
+    if not k_probs or not consistency_signal:
+        return k_probs
+    if consistency_signal.get("ks_track_with_good_outings"):
+        return k_probs
+    return {t: round(max(0.0, p * 0.95), 3) for t, p in k_probs.items()}
 
 
 def strikeout_floor_probs(k_list, thresholds=None):
@@ -896,6 +1020,54 @@ def get_pitcher_recent_form(pitcher_id, season=None, last_n=5):
     }
 
 
+def blended_runs_allowed(season_allowed, recent, pitcher_form, bullpen, fatigue):
+    """
+    Shared blend used by both spread_cover_prob and total_runs_prob so
+    there's one source of truth for how a team's runs-allowed estimate is
+    built. WEIGHTS (re-balanced now that bullpen and recent-team-form are
+    separate inputs, not folded into "starter + season" alone):
+      runs_allowed = 0.40 season + 0.20 recent-team + 0.30 starter + 0.10 bullpen
+    A missing input's weight is redistributed proportionally across whatever
+    IS available, rather than assuming a league-average value for it.
+    ALL WEIGHTS ABOVE ARE DISCLOSED, UNFITTED CHOICES - not backtested
+    against settled results. Treat every output as directional, not gospel.
+    """
+    components = [(season_allowed, 0.40)]
+    if recent and recent.get("runs_allowed_pg") is not None:
+        components.append((recent["runs_allowed_pg"], 0.20))
+    if pitcher_form and pitcher_form.get("starts_sampled", 0) >= 3:
+        starter_val = pitcher_form["recent_era"]
+        if fatigue and fatigue.get("is_fatigue_flag"):
+            starter_val *= 1.08  # small, disclosed fatigue penalty - unfitted
+        components.append((starter_val, 0.30))
+    if bullpen and bullpen.get("staff_era"):
+        components.append((bullpen["staff_era"], 0.10))
+    total_weight = sum(w for _, w in components)
+    if total_weight == 0:
+        return season_allowed
+    return round(sum(v * w for v, w in components) / total_weight, 2)
+
+
+def blended_runs_scored(season_scored, recent):
+    """Shared blend used by both spread_cover_prob and total_runs_prob."""
+    if recent and recent.get("runs_scored_pg") is not None:
+        return round(season_scored * 0.7 + recent["runs_scored_pg"] * 0.3, 2)
+    return season_scored
+
+
+def park_scoring_scale(park_run_factor):
+    """
+    Dampened (sqrt) scaling applied to the expected LEVEL of scoring for a
+    game at this park, not just to variance. Same dampening pattern as the
+    existing variance-widening scale below and as park_so_factor's 0.5
+    dampening elsewhere in this file - not applied linearly.
+    UNFITTED CONSTANT: sqrt dampening, not backtested against settled
+    results. Shared by spread_cover_prob and total_runs_prob so a hitter's
+    park like Coors shifts both markets consistently.
+    """
+    return (park_run_factor / 100) ** 0.5
+
+
 def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, std_dev=4.2,
                        pitcher_a_form=None, pitcher_b_form=None, pitcher_a_fatigue=None,
                        pitcher_b_fatigue=None, league_avg_era=4.20,
@@ -913,40 +1085,21 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
       - pitcher_x_fatigue: short-rest/declining-innings flag
       - weather_a: home-park weather snapshot
 
-    WEIGHTS (re-balanced now that bullpen and recent-team-form are separate
-    inputs, not folded into "starter + season" alone):
-      runs_allowed = 0.40 season + 0.20 recent-team + 0.30 starter + 0.10 bullpen
-    A missing input's weight is redistributed proportionally across whatever
-    IS available, rather than assuming a league-average value for it.
-    ALL WEIGHTS ABOVE ARE DISCLOSED, UNFITTED CHOICES - not backtested
-    against settled results. Treat every output as directional, not gospel.
-
     spread is from team_a's perspective. std_dev ~4.2 runs is an approximate
     MLB single-game margin std dev. park_run_factor: venue R factor (100=neutral).
+
+    PARK FACTOR APPLIES TWICE, TO TWO DIFFERENT THINGS:
+      1. It shifts the expected LEVEL of scoring itself (both teams'
+         blended runs_scored/runs_allowed are scaled by park_scoring_scale
+         BEFORE expected_margin is computed) - a hitter's park like Coors
+         should raise the actual expected run total for both sides, not
+         just widen the range of outcomes around an unchanged margin.
+      2. It also still widens/narrows adj_std_dev (the uncertainty band),
+         since a high-scoring park also tends to produce more variable
+         final margins. Both effects are real and both are kept.
     """
     if not team_a_stats or not team_b_stats:
         return None
-
-    def blended_runs_allowed(season_allowed, recent, pitcher_form, bullpen, fatigue):
-        components = [(season_allowed, 0.40)]
-        if recent and recent.get("runs_allowed_pg") is not None:
-            components.append((recent["runs_allowed_pg"], 0.20))
-        if pitcher_form and pitcher_form.get("starts_sampled", 0) >= 3:
-            starter_val = pitcher_form["recent_era"]
-            if fatigue and fatigue.get("is_fatigue_flag"):
-                starter_val *= 1.08  # small, disclosed fatigue penalty - unfitted
-            components.append((starter_val, 0.30))
-        if bullpen and bullpen.get("staff_era"):
-            components.append((bullpen["staff_era"], 0.10))
-        total_weight = sum(w for _, w in components)
-        if total_weight == 0:
-            return season_allowed
-        return round(sum(v * w for v, w in components) / total_weight, 2)
-
-    def blended_runs_scored(season_scored, recent):
-        if recent and recent.get("runs_scored_pg") is not None:
-            return round(season_scored * 0.7 + recent["runs_scored_pg"] * 0.3, 2)
-        return season_scored
 
     a_runs_allowed = blended_runs_allowed(
         team_a_stats["runs_allowed_pg"], team_a_recent, pitcher_a_form, bullpen_a, pitcher_a_fatigue)
@@ -954,6 +1107,12 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
         team_b_stats["runs_allowed_pg"], team_b_recent, pitcher_b_form, bullpen_b, pitcher_b_fatigue)
     a_runs_scored = blended_runs_scored(team_a_stats["runs_scored_pg"], team_a_recent)
     b_runs_scored = blended_runs_scored(team_b_stats["runs_scored_pg"], team_b_recent)
+
+    scoring_scale = park_scoring_scale(park_run_factor)
+    a_runs_scored *= scoring_scale
+    b_runs_scored *= scoring_scale
+    a_runs_allowed *= scoring_scale
+    b_runs_allowed *= scoring_scale
 
     expected_margin = (a_runs_scored - a_runs_allowed) - (b_runs_scored - b_runs_allowed)
 
@@ -968,6 +1127,81 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
     z = (spread + expected_margin) / adj_std_dev
     prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
     return round(prob, 3)
+
+
+def total_runs_prob(team_a_stats, team_b_stats, total_line, park_run_factor=100,
+                     std_dev=5.6, pitcher_a_form=None, pitcher_b_form=None,
+                     pitcher_a_fatigue=None, pitcher_b_fatigue=None,
+                     team_a_recent=None, team_b_recent=None,
+                     bullpen_a=None, bullpen_b=None):
+    """
+    Estimate P(combined runs > total_line) using a normal approximation,
+    same style as spread_cover_prob's z-score approach. Reuses the same
+    blended_runs_allowed / blended_runs_scored / park_scoring_scale helpers
+    as spread_cover_prob (see item 1's park-factor fix) rather than
+    duplicating that blend logic, so both markets react to park factor the
+    same way.
+
+    Each team's expected run contribution = average of its own park-scaled
+    scoring rate and the opponent's park-scaled rate of allowing runs (same
+    "both signals matter" idea as margin, but summed instead of differenced).
+    mean = sum of both teams' expected contributions.
+
+    std_dev: MLB combined-game totals are a DIFFERENT, wider distribution
+    than a single team's margin. UNFITTED CONSTANT: 5.6 runs, a separate,
+    disclosed guess - not the margin model's 4.2, and not backtested.
+    """
+    if not team_a_stats or not team_b_stats:
+        return None
+
+    a_runs_allowed = blended_runs_allowed(
+        team_a_stats["runs_allowed_pg"], team_a_recent, pitcher_a_form, bullpen_a, pitcher_a_fatigue)
+    b_runs_allowed = blended_runs_allowed(
+        team_b_stats["runs_allowed_pg"], team_b_recent, pitcher_b_form, bullpen_b, pitcher_b_fatigue)
+    a_runs_scored = blended_runs_scored(team_a_stats["runs_scored_pg"], team_a_recent)
+    b_runs_scored = blended_runs_scored(team_b_stats["runs_scored_pg"], team_b_recent)
+
+    scoring_scale = park_scoring_scale(park_run_factor)
+    a_runs_scored *= scoring_scale
+    b_runs_scored *= scoring_scale
+    a_runs_allowed *= scoring_scale
+    b_runs_allowed *= scoring_scale
+
+    # UNFITTED CONSTANT: simple average of the two signals (own scoring
+    # rate vs opponent's allowing rate), not weighted.
+    a_expected = (a_runs_scored + b_runs_allowed) / 2
+    b_expected = (b_runs_scored + a_runs_allowed) / 2
+    expected_total = a_expected + b_expected
+
+    adj_std_dev = std_dev * park_scoring_scale(park_run_factor)  # same dampened widening as margin
+
+    z = (expected_total - total_line) / adj_std_dev
+    over_prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    return {
+        "line": total_line,
+        "expected_total": round(expected_total, 2),
+        "over_prob": round(over_prob, 3),
+        "under_prob": round(1 - over_prob, 3),
+    }
+
+
+def build_total_runs_lines(expected_total, rungs=2, step=1.0):
+    """
+    Generates a plausible total-runs line centered on the model's own
+    blended expected-total, with `rungs` above/below at `step` intervals -
+    mirrors the rung-generation pattern used for pitcher K thresholds
+    (_build_player_thresholds-style), adapted to runs, since this is a
+    probability-only model with no live sportsbook odds feed to pull a
+    real total line from. Lines are rounded to the nearest .5 (standard
+    total-runs line convention).
+    """
+    if expected_total is None:
+        return []
+    center = round(expected_total * 2) / 2
+    lines = []
+    for i in range(-rungs, rungs + 1):
+        lines.append(round(center + i * step, 1))
+    return sorted(set(lines))
 
 
 def yrfi_nrfi_prob(pitcher_a_form, pitcher_b_form, team_a_stats, team_b_stats,
@@ -1091,11 +1325,25 @@ def get_batter_recent_game_logs(batter_id, season=None, last_n=15):
     return games
 
 
+# A "0+" (or otherwise trivial) floor on a counting stat is meaningless as
+# a bettable pick - almost every player clears it almost every game, so it
+# would otherwise surface as a false "safe" pick. Minimum bettable
+# threshold per stat, below which we don't report a floor at all.
+MIN_BETTABLE_THRESHOLD = {
+    "hits": 1,
+    "home_runs": 1,
+    "rbi": 1,
+    "total_bases": 1,
+}
+
+
 def batter_prop_floor_probs(game_logs, thresholds=None):
     """
     Empirical probability of hitting each prop threshold, based on recent
     games - same style as strikeout_floor_probs. thresholds is a dict of
     {stat_key: [threshold values]}, defaults cover the common markets.
+    Any threshold below MIN_BETTABLE_THRESHOLD for that stat is skipped -
+    a "0+" floor is trivially true almost every game and isn't a real pick.
     """
     if thresholds is None:
         thresholds = {
@@ -1109,11 +1357,78 @@ def batter_prop_floor_probs(game_logs, thresholds=None):
         return {}
     probs = {}
     for stat_key, t_list in thresholds.items():
+        min_t = MIN_BETTABLE_THRESHOLD.get(stat_key, 1)
         probs[stat_key] = {}
         for t in t_list:
+            if t < min_t:
+                continue
             hits = sum(1 for g in game_logs if g.get(stat_key, 0) >= t)
             probs[stat_key][t] = round(hits / n, 3)
     return probs
+
+
+def adjust_batter_floor_for_matchup(base_probs, matchup_context):
+    """
+    Nudges batter prop floor probabilities based on tonight's opposing
+    starter's strikeout rate against this batter's handedness (from
+    get_opponent_pitcher_matchup_context). A tough matchup pitcher (high
+    K rate vs this handedness) should lower hit-prop floors; a weak
+    matchup should raise them slightly. Same "small, disclosed, unfitted
+    dampened multiplier" pattern as adjust_k_floor_for_opponent - not
+    backtested, purely directional.
+
+    Uses a league-average K-rate-vs-handedness baseline (roughly modern
+    MLB norm) since get_opponent_pitcher_matchup_context returns a single
+    pitcher's rate, not a comparison point - without a baseline there's
+    nothing to compare "tough" or "weak" against.
+    """
+    if not base_probs or not matchup_context:
+        return base_probs
+    pitcher_k_rate = matchup_context.get("pitcher_k_rate_vs_this_handedness")
+    if pitcher_k_rate is None:
+        return base_probs
+    league_avg_k_rate_vs_hand = 0.22  # UNFITTED CONSTANT - rough modern-MLB K-rate-per-PA baseline, not backtested
+    factor = pitcher_k_rate / league_avg_k_rate_vs_hand
+    # Dampened and inverted: a tougher-than-average matchup (factor > 1)
+    # should PULL DOWN hit-prop floors, not up - opposite direction from
+    # the K-prop adjustment, since more opponent K's is bad for a hitter.
+    adj_factor = 1 - (factor - 1) * 0.3  # UNFITTED CONSTANT - dampened, disclosed, not backtested
+    adjusted = {}
+    for stat_key, thresholds in base_probs.items():
+        adjusted[stat_key] = {}
+        for t, prob in thresholds.items():
+            new_prob = prob * adj_factor
+            adjusted[stat_key][t] = round(max(0.0, min(1.0, new_prob)), 3)
+    return adjusted
+
+
+def batter_prop_thin_margin_flags(game_logs, floor_probs):
+    """
+    For each reported floor threshold, checks whether the batter usually
+    clears it with room to spare or is barely scraping over it most
+    games - same "thin margin" idea used for pitcher K props. A batter who
+    hits exactly 1 hit in most of his qualifying games (not 2+) is a much
+    less comfortable "1+ hits" pick than one who usually gets 2-3.
+    Returns {stat_key: {threshold: bool_is_thin}}.
+
+    "Thin" here means: among games where the batter cleared the threshold,
+    the average amount by which he cleared it is small (<0.5 over the
+    line) - a simple, explainable check, not a full distribution analysis.
+    UNFITTED CONSTANT: 0.5 margin cutoff, a disclosed guess.
+    """
+    flags = {}
+    if not game_logs or not floor_probs:
+        return flags
+    for stat_key, thresholds in floor_probs.items():
+        flags[stat_key] = {}
+        for t in thresholds:
+            clearing_games = [g.get(stat_key, 0) for g in game_logs if g.get(stat_key, 0) >= t]
+            if not clearing_games:
+                flags[stat_key][t] = False
+                continue
+            avg_margin_over = sum(v - t for v in clearing_games) / len(clearing_games)
+            flags[stat_key][t] = avg_margin_over < 0.5  # UNFITTED CONSTANT - see docstring
+    return flags
 
 
 def get_batter_home_away_split(game_logs):
@@ -1220,17 +1535,23 @@ def build_batter_props_for_game(game, opp_pitcher_id_by_side):
             logs = get_batter_recent_game_logs(player["id"])
             if not logs:
                 continue
-            floors = batter_prop_floor_probs(logs)
+            raw_floors = batter_prop_floor_probs(logs)
             splits = get_batter_home_away_split(logs)
             matchup = (get_opponent_pitcher_matchup_context(opp_pitcher_id, player["bat_side"])
                        if opp_pitcher_id else None)
+            # Actually apply the matchup adjustment - previously fetched
+            # and stored but never used to move the floor probabilities.
+            floors = adjust_batter_floor_for_matchup(raw_floors, matchup)
+            thin_margin_flags = batter_prop_thin_margin_flags(logs, floors)
             il_check = check_batter_recent_il_activation(player["id"])
             results.append({
                 "name": player["name"],
                 "side": side,
                 "bat_side": player["bat_side"],
                 "games_sampled": len(logs),
+                "floor_probabilities_raw": raw_floors,
                 "floor_probabilities": floors,
+                "thin_margin_flags": thin_margin_flags,
                 "home_away_split": splits,
                 "opponent_pitcher_matchup": matchup,
                 "il_check": il_check,
@@ -1291,8 +1612,11 @@ def build_report():
         ]:
             if not pid:
                 continue
-            k_list = get_pitcher_recent_strikeouts(pid)
+            start_gamelogs = get_pitcher_start_gamelogs(pid)
+            k_list = [g["strikeouts"] for g in start_gamelogs]
             base_probs = strikeout_floor_probs(k_list)
+            k_per_ip = get_pitcher_k_per_ip(pid)
+            consistency = strikeout_consistency_signal(start_gamelogs)
 
             # Opponent K tendency: prefer the RECENT (last-~12-game) trend
             # over the season-long rate when we have it, since a lineup's
@@ -1339,6 +1663,22 @@ def build_report():
                     t: round(max(0.0, p * 0.92), 3) for t, p in park_adjusted_probs.items()
                 }
 
+            # Sanity-check today's K floor against a projected innings count
+            # (reuse the innings trend already used for fatigue, rather than
+            # inventing a new innings-projection source) - if he's likely
+            # to go shorter today than the innings his K floor was built
+            # from, discount the floor.
+            projected_innings = None
+            if fatigue and fatigue.get("innings_trend"):
+                projected_innings = round(sum(fatigue["innings_trend"]) / len(fatigue["innings_trend"]), 2)
+            park_adjusted_probs = discount_k_floor_for_projected_innings(
+                park_adjusted_probs, k_per_ip, projected_innings)
+
+            # Strikeout consistency: small dampening on the floor itself,
+            # plus a plain-English flag surfaced separately below (not just
+            # silently folded into the number).
+            park_adjusted_probs = dampen_k_floor_for_inconsistency(park_adjusted_probs, consistency)
+
             opponent_team_id_for_lineup = opp_id
             lineup_handedness = get_confirmed_lineup_handedness(g["gamePk"], opponent_team_id_for_lineup)
             lineup_matchup = assess_pitcher_vs_lineup(platoon, lineup_handedness)
@@ -1363,6 +1703,9 @@ def build_report():
                 "fatigue": fatigue,
                 "il_check": il_check,
                 "lineup_matchup": lineup_matchup,
+                "k_per_ip": k_per_ip,
+                "projected_innings": projected_innings,
+                "strikeout_consistency": consistency,
             })
 
         away_stats = team_run_stats_cache.get(g["away_team_id"])
@@ -1424,6 +1767,33 @@ def build_report():
             bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
         )
         entry["moneyline"] = {"away_win_prob": ml_away, "home_win_prob": ml_home}
+
+        # Total Runs (Over/Under): reuses the same blended inputs as the
+        # spread model (season + recent + starter + bullpen), with the same
+        # park-factor-shifts-scoring fix applied. No live sportsbook odds
+        # feed exists here, so the line(s) tested are generated centered on
+        # the model's own blended expected-total, mirroring how K
+        # thresholds are generated around a pitcher's own average.
+        total_probe = total_runs_prob(
+            away_stats, home_stats, total_line=8.5, park_run_factor=park_r_factor,
+            pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
+            pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
+            team_a_recent=away_recent, team_b_recent=home_recent,
+            bullpen_a=away_bullpen, bullpen_b=home_bullpen,
+        )
+        total_runs_lines = []
+        if total_probe:
+            for line in build_total_runs_lines(total_probe["expected_total"]):
+                result = total_runs_prob(
+                    away_stats, home_stats, total_line=line, park_run_factor=park_r_factor,
+                    pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
+                    pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
+                    team_a_recent=away_recent, team_b_recent=home_recent,
+                    bullpen_a=away_bullpen, bullpen_b=home_bullpen,
+                )
+                if result:
+                    total_runs_lines.append(result)
+        entry["total_runs"] = total_runs_lines
 
         # YRFI/NRFI: independent of the spread model above (single-inning
         # Poisson approach, not the full-game normal approximation), using
@@ -1557,6 +1927,10 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                     trend_word = "lately" if p.get("opponent_k_source", "").startswith("recent") else "this season"
                     reasons.append(f"{p['opponent']} strikes out {p['opponent_k_per_game']}/game {trend_word} "
                                    f"(league average {p['league_avg_k_per_game']})")
+                flags = []
+                consistency = p.get("strikeout_consistency")
+                if consistency and consistency.get("note"):
+                    flags.append(consistency["note"])
                 game_picks.append({
                     "type": "Strikeouts",
                     "player": p["name"],
@@ -1564,11 +1938,13 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                     "pick_label": f'{best["threshold"]}+ strikeouts',
                     "prob": best["prob"],
                     "reasons": reasons,
+                    "flags": flags,
                 })
 
         # --- batter props ---
         for b in g.get("batter_props", []):
             floors = b.get("floor_probabilities") or {}
+            thin_flags = b.get("thin_margin_flags") or {}
             stat_labels = {"hits": "hits", "home_runs": "home runs", "rbi": "RBIs", "total_bases": "total bases"}
             for stat_key, stat_label in stat_labels.items():
                 best = _lowest_safe_threshold(floors.get(stat_key), min_confidence)
@@ -1578,6 +1954,9 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                     if matchup_info:
                         reasons.append(f"tonight's opposing pitcher has struggled against hitters like him "
                                        f"({matchup_info['pitcher_k_rate_vs_this_handedness']*100:.0f}% strikeout rate faced)")
+                    flags = []
+                    if thin_flags.get(stat_key, {}).get(best["threshold"]):
+                        flags.append(f"THIN MARGIN - he usually just barely clears {best['threshold']}+ {stat_label}, not by much")
                     game_picks.append({
                         "type": stat_label.capitalize(),
                         "player": b["name"],
@@ -1585,7 +1964,29 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                         "pick_label": f'{best["threshold"]}+ {stat_label}',
                         "prob": best["prob"],
                         "reasons": reasons,
+                        "flags": flags,
                     })
+
+        # --- total runs (over/under) ---
+        best_total_per_side = {}
+        for tr in g.get("total_runs", []):
+            for side_label, prob, pick_label in (
+                ("Over", tr.get("over_prob"), f'Over {tr["line"]}'),
+                ("Under", tr.get("under_prob"), f'Under {tr["line"]}'),
+            ):
+                if prob is not None and prob >= min_confidence:
+                    candidate = {
+                        "type": "Total Runs",
+                        "player": matchup,
+                        "team_context": matchup,
+                        "pick_label": pick_label,
+                        "prob": prob,
+                        "reasons": [f"model projects {tr['expected_total']} combined runs tonight"],
+                        "flags": [],
+                    }
+                    if side_label not in best_total_per_side or prob > best_total_per_side[side_label]["prob"]:
+                        best_total_per_side[side_label] = candidate
+        game_picks.extend(best_total_per_side.values())
 
         # --- team spread covers (best line per team, not every threshold) ---
         best_spread_per_team = {}
@@ -1601,6 +2002,7 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                         "pick_label": f'{s["spread"]:+} spread',
                         "prob": prob,
                         "reasons": [f"model favors {side_label} to cover {s['spread']:+} tonight"],
+                        "flags": [],
                     }
                     if key not in best_spread_per_team or prob > best_spread_per_team[key]["prob"]:
                         best_spread_per_team[key] = candidate
@@ -1619,6 +2021,7 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                         "pick_label": f'{side_label} to win',
                         "prob": prob,
                         "reasons": [f"model favors {side_label} to win outright tonight"],
+                        "flags": [],
                     })
 
         # --- YRFI / NRFI (run in the 1st inning, yes or no) ---
@@ -1635,6 +2038,7 @@ def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PIC
                         "prob": prob,
                         "reasons": [f"model favors {label} ({'a run scores' if label == 'YRFI' else 'no run scores'} "
                                     f"in the 1st) tonight"],
+                        "flags": [],
                     })
 
 
@@ -1677,6 +2081,9 @@ def _render_top_picks(games):
             reasons_html = ""
             if pk.get("reasons"):
                 reasons_html = '<ul class="pick-reasons">' + "".join(f"<li>{r}</li>" for r in pk["reasons"]) + "</ul>"
+            flags_html = ""
+            if pk.get("flags"):
+                flags_html = "".join(f'<div class="flag-chip flag-chip-inline">&#9888; {f}</div>' for f in pk["flags"])
             rows.append(f"""
           <div class="pick-card">
             <div class="pick-card-top">
@@ -1686,6 +2093,7 @@ def _render_top_picks(games):
             <p class="pick-player">{pk["player"]}</p>
             <p class="pick-line">{pk["pick_label"]}</p>
             {reasons_html}
+            {flags_html}
           </div>""")
 
         game_blocks.append(f"""
@@ -1728,6 +2136,18 @@ def render_html(report):
             block.append(_prob_bar(g["home_team"], s["home_cover_prob"], "var(--orange)"))
             block.append('</div>')
         block.append('</div>')
+
+        total_runs = g.get("total_runs") or []
+        if total_runs:
+            block.append('<h3 class="section-label">Total Runs (Over/Under)</h3>')
+            block.append('<div class="spread-block">')
+            for tr in total_runs:
+                block.append('<div class="spread-row-group">')
+                block.append(f'<span class="spread-num">{tr["line"]}</span>')
+                block.append(_prob_bar(f'Over {tr["line"]}', tr["over_prob"], "var(--teal)"))
+                block.append(_prob_bar(f'Under {tr["line"]}', tr["under_prob"], "var(--orange)"))
+                block.append('</div>')
+            block.append('</div>')
 
         yn = g.get("yrfi_nrfi")
         if yn and yn.get("yrfi_prob") is not None:
@@ -1800,7 +2220,15 @@ def render_html(report):
                              f'(league average is {p["league_avg_k_per_game"]}){rank_txt}</li>')
             if p.get("weather_description"):
                 block.append(f'<li>{p["weather_description"]}</li>')
+            k_per_ip = p.get("k_per_ip")
+            if k_per_ip:
+                block.append(f'<li>Strikes out {k_per_ip["k_per_ip"]} batters per inning pitched over his last '
+                             f'{k_per_ip["starts_sampled"]} starts (averaging {k_per_ip["avg_ip_per_start"]} IP/start)</li>')
             block.append('</ul>')
+
+            consistency = p.get("strikeout_consistency")
+            if consistency and consistency.get("note"):
+                block.append(f'<div class="flag-chip flag-chip-inline">&#9888; {consistency["note"].capitalize()}.</div>')
 
             block.append('<div class="stat-group">')
             block.append('<span class="stat-group-label">Strikeouts</span>')
