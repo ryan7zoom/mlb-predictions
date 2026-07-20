@@ -2,8 +2,11 @@ name: Daily MLB Report
 
 on:
   schedule:
-    - cron: '0 14 * * *'
-  workflow_dispatch: {}
+    - cron: '0 12 * * *'   # 06:00 AM ET / 18:00 Bangladesh - early check, lineups likely not posted yet
+    - cron: '0 16 * * *'   # 12:00 PM ET / 22:00 Bangladesh - most lineups posted by now
+    - cron: '0 19 * * *'   # 03:00 PM ET / 01:00 Bangladesh - catches late-posting lineups
+    - cron: '30 21 * * *'  # 05:30 PM ET / 03:30 Bangladesh - last call before early games start
+  workflow_dispatch: {}   # manual "Run workflow" button always fetches fresh live data
 
 permissions:
   contents: read
