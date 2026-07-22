@@ -163,21 +163,6 @@ def get_mlb_odds():
         return None
 
 
-def _remove_vig_two_way(decimal_odds_a, decimal_odds_b):
-    """
-    Converts a pair of two-way decimal odds into de-vigged ("fair") implied
-    probabilities that sum to exactly 1.0.
-    """
-    if not decimal_odds_a or not decimal_odds_b or decimal_odds_a <= 1 or decimal_odds_b <= 1:
-        return None, None
-    raw_a = 1 / decimal_odds_a
-    raw_b = 1 / decimal_odds_b
-    overround = raw_a + raw_b
-    if overround <= 0:
-        return None, None
-    return raw_a / overround, raw_b / overround
-
-
 def _book_price(bookmakers, market_key, point=None, max_decimal=None):
     """
     Pulls the decimal price for each outcome from the (single, filtered-
@@ -228,21 +213,30 @@ def _book_price(bookmakers, market_key, point=None, max_decimal=None):
 
 
 # A spread or total is close to a coinflip by construction (that's the
-# point of the book setting the line where it does) - real de-vigged
-# prices on these markets essentially never exceed ~6.0-7.0 decimal
-# (roughly <15%). Anything beyond that on a spread/total quote is a
-# bad data point, not a real long-shot price like you'd see on a
-# moneyline. Used as the max_decimal ceiling for spreads/totals only.
-SPREAD_TOTAL_MAX_DECIMAL = 7.0
+# point of the book setting the line where it does). Even a book leaning
+# hard one way on a standard line rarely prices either side past ~3.0
+# decimal (~33% implied) - the book would move the actual POINT before
+# letting the price drift further than that. 4.73 (21%) or 13.6 (7%) on
+# a spread/total side is not a "skewed line," it's bad data. Used as the
+# max_decimal ceiling for spreads/totals only (moneyline can legitimately
+# go much further, e.g. a big favorite/underdog).
+SPREAD_TOTAL_MAX_DECIMAL = 3.2
+
 
 
 def get_market_lines_for_event(event, home_team, away_team):
     """
-    Pulls fair (de-vigged) probabilities for h2h, spreads, and totals out
-    of one Odds API event object, sourced from a single named book
-    (ODDS_BOOKMAKER_KEY - see get_mlb_odds). Any market that book didn't
-    post today is simply absent, never guessed at and never filled in
-    from a different book.
+    Pulls RAW prices for h2h, spreads, and totals straight from a single
+    named book (ODDS_BOOKMAKER_KEY - see get_mlb_odds), exactly as posted.
+
+    No de-vigging: "market_prob" here is just 1/decimal_price for each
+    side (the book's raw implied probability, house margin included), not
+    a "fair" probability. What's shown is exactly what that book has on
+    its board right now - decimal price and the straightforward implied
+    percentage that comes from it, nothing adjusted or modeled.
+
+    Any market that book didn't post today is simply absent, never
+    guessed at and never filled in from a different book.
     """
     bookmakers = event.get("bookmakers", [])
     if not bookmakers:
@@ -251,12 +245,12 @@ def get_market_lines_for_event(event, home_team, away_team):
 
     h2h_price = _book_price(bookmakers, "h2h")
     if home_team in h2h_price and away_team in h2h_price:
-        home_prob, away_prob = _remove_vig_two_way(h2h_price[home_team], h2h_price[away_team])
-        if home_prob is not None:
-            result["h2h"] = {
-                "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
-                "home_decimal": round(h2h_price[home_team], 3), "away_decimal": round(h2h_price[away_team], 3),
-            }
+        result["h2h"] = {
+            "home_prob": round(1 / h2h_price[home_team], 4),
+            "away_prob": round(1 / h2h_price[away_team], 4),
+            "home_decimal": round(h2h_price[home_team], 3),
+            "away_decimal": round(h2h_price[away_team], 3),
+        }
 
     spread_points = set()
     for bm in bookmakers:
@@ -270,12 +264,13 @@ def get_market_lines_for_event(event, home_team, away_team):
         home_price = _book_price(bookmakers, "spreads", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
         away_price = _book_price(bookmakers, "spreads", point=-point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
         if home_team in home_price and away_team in away_price:
-            home_prob, away_prob = _remove_vig_two_way(home_price[home_team], away_price[away_team])
-            if home_prob is not None:
-                spreads_out.append({
-                    "point": point, "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
-                    "home_decimal": round(home_price[home_team], 3), "away_decimal": round(away_price[away_team], 3),
-                })
+            spreads_out.append({
+                "point": point,
+                "home_prob": round(1 / home_price[home_team], 4),
+                "away_prob": round(1 / away_price[away_team], 4),
+                "home_decimal": round(home_price[home_team], 3),
+                "away_decimal": round(away_price[away_team], 3),
+            })
     if spreads_out:
         result["spreads"] = spreads_out
 
@@ -290,12 +285,13 @@ def get_market_lines_for_event(event, home_team, away_team):
     for point in sorted(total_points):
         price = _book_price(bookmakers, "totals", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
         if "Over" in price and "Under" in price:
-            over_prob, under_prob = _remove_vig_two_way(price["Over"], price["Under"])
-            if over_prob is not None:
-                totals_out.append({
-                    "point": point, "over_prob": round(over_prob, 4), "under_prob": round(under_prob, 4),
-                    "over_decimal": round(price["Over"], 3), "under_decimal": round(price["Under"], 3),
-                })
+            totals_out.append({
+                "point": point,
+                "over_prob": round(1 / price["Over"], 4),
+                "under_prob": round(1 / price["Under"], 4),
+                "over_decimal": round(price["Over"], 3),
+                "under_decimal": round(price["Under"], 3),
+            })
     if totals_out:
         result["totals"] = totals_out
 
@@ -2115,24 +2111,28 @@ def _render_empty_state():
 
 
 MIN_EDGE_POINTS = 5.0   # minimum model-vs-market edge (percentage points) to surface a pick
+MAX_EDGE_POINTS = 25.0  # a real book doesn't leave an edge bigger than this on a spread/total -
+                        # above it, treat as a bug signal (model/market mismatch) rather than a find
 TOP_PICKS_LIMIT = 20    # cap on total picks shown, not games
 
 
 def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
     """
     Scans every game for spread and total lines where BOTH a model
-    probability AND a real de-vigged market probability exist, and keeps
-    only the ones where the model beats the market by at least `min_edge`
-    percentage points. This replaces the old "model confidence alone"
-    approach entirely - a bare model probability with nothing to compare
-    it against is not surfaced here at all, no matter how high it is.
+    probability AND a RAW market price exist (straight from the book,
+    house margin included - no de-vigging), and keeps only the ones
+    where the model beats the market's raw implied probability by at
+    least `min_edge` percentage points. This replaces the old "model
+    confidence alone" approach entirely - a bare model probability with
+    nothing to compare it against is not surfaced here at all, no matter
+    how high it is.
 
     No player props, no bet builders, no moneyline/YRFI - spread and
     total only, per the decision to focus exclusively on markets where a
     real, checkable market price exists via the free odds feed.
 
-    Each pick includes the fair decimal odds implied by BOTH the model's
-    probability and the market's probability, so the gap is visible at a
+    Each pick includes the model's implied decimal odds and the book's
+    actual posted decimal odds side by side, so the gap is visible at a
     glance and directly usable for staking.
     """
     picks = []
@@ -2142,18 +2142,21 @@ def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
         market = g.get("market") or {}
 
         # --- spread ---
+        # Each market.spreads entry is keyed by the HOME team's book point
+        # and holds BOTH sides' raw prob/decimal (home_prob/away_prob,
+        # home_decimal/away_decimal) together - it's one two-way market, not
+        # two separate entries. So both home and away picks pull from the
+        # SAME entry; there's no separate "away point" entry to look up.
         market_spreads = {s["point"]: s for s in market.get("spreads", [])}
         for s in g.get("spread_lines", []):
             away_point = s["spread"]  # s["spread"] is always the AWAY team's perspective point
-            # market_spreads is keyed by the HOME team's book point, so the
-            # away point must be negated to look up home's market line, and
-            # matched directly (no negation) to look up away's market line.
-            home_market = market_spreads.get(-away_point)
-            away_market = market_spreads.get(away_point)
-            for side_label, model_prob, market_entry, market_prob_key, market_dec_key, line_point in (
-                (g["home_team"], s.get("home_cover_prob"), home_market, "home_prob", "home_decimal", -away_point),
-                (g["away_team"], s.get("away_cover_prob"), away_market, "away_prob", "away_decimal", away_point),
+            home_point = -away_point  # market_spreads is keyed by the home point
+            market_entry_for_line = market_spreads.get(home_point)
+            for side_label, model_prob, market_prob_key, market_dec_key, line_point in (
+                (g["home_team"], s.get("home_cover_prob"), "home_prob", "home_decimal", home_point),
+                (g["away_team"], s.get("away_cover_prob"), "away_prob", "away_decimal", away_point),
             ):
+                market_entry = market_entry_for_line
                 if model_prob is None or not market_entry:
                     continue
                 market_prob = market_entry.get(market_prob_key)
@@ -2161,14 +2164,30 @@ def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
                 edge = calc_edge(model_prob, market_prob)
                 # Sanity backstop, not a fix: a real MLB run-line point is
                 # essentially always within ±3.5, and a legitimate model
-                # probability on a spread this close almost never saturates
-                # to near-certain. Values outside these bounds indicate a
-                # matching/unit bug upstream (log and skip, don't display).
+                # OR market probability on a spread this close almost never
+                # sits outside a moderate range - a real book keeps both
+                # sides of a spread/total close to a coinflip by design.
+                # Values outside these bounds indicate a matching/unit bug
+                # or bad market data upstream (log and skip, don't display).
                 if abs(line_point) > 3.5:
                     print(f"BUG SIGNAL: skipping spread pick with implausible point {line_point} ({matchup})")
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
                     print(f"BUG SIGNAL: skipping spread pick with implausible model_prob {model_prob} ({matchup})")
+                    continue
+                if market_prob is None or market_prob >= 0.70 or market_prob <= 0.30:
+                    print(f"BUG SIGNAL: skipping spread pick with implausible market_prob {market_prob} ({matchup})")
+                    continue
+                # A real, honest model-vs-market gap on a spread is a few
+                # points, occasionally into the teens on a genuine mismatch.
+                # An edge this large (MAX_EDGE_POINTS+) with both inputs
+                # individually "plausible" is still much more likely to
+                # mean the model and market are quietly talking about
+                # different things than that the model found free money -
+                # a real sportsbook does not leave a 30+ point edge on the
+                # board. Log it as a bug signal rather than a pick.
+                if edge is not None and edge > MAX_EDGE_POINTS:
+                    print(f"BUG SIGNAL: skipping spread pick with implausible edge {edge} ({matchup})")
                     continue
                 if edge is not None and edge >= min_edge:
                     picks.append({
@@ -2200,13 +2219,20 @@ def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
                 market_decimal = market_entry.get(market_dec_key)
                 edge = calc_edge(model_prob, market_prob)
                 # Same sanity backstop as spreads: real MLB totals run
-                # roughly 6-13, and a legitimate total-line probability
-                # shouldn't saturate near-certain either.
+                # roughly 6-13, and neither the model NOR the market
+                # probability on a total should sit far from a coinflip -
+                # a real book keeps both sides close by design.
                 if not (6 <= line <= 13):
                     print(f"BUG SIGNAL: skipping total pick with implausible line {line} ({matchup})")
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
                     print(f"BUG SIGNAL: skipping total pick with implausible model_prob {model_prob} ({matchup})")
+                    continue
+                if market_prob is None or market_prob >= 0.70 or market_prob <= 0.30:
+                    print(f"BUG SIGNAL: skipping total pick with implausible market_prob {market_prob} ({matchup})")
+                    continue
+                if edge is not None and edge > MAX_EDGE_POINTS:
+                    print(f"BUG SIGNAL: skipping total pick with implausible edge {edge} ({matchup})")
                     continue
                 if edge is not None and edge >= min_edge:
                     picks.append({
