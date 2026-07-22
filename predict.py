@@ -212,15 +212,27 @@ def _book_price(bookmakers, market_key, point=None, max_decimal=None):
     return result
 
 
-# A spread or total is close to a coinflip by construction (that's the
-# point of the book setting the line where it does). Even a book leaning
-# hard one way on a standard line rarely prices either side past ~3.0
-# decimal (~33% implied) - the book would move the actual POINT before
-# letting the price drift further than that. 4.73 (21%) or 13.6 (7%) on
-# a spread/total side is not a "skewed line," it's bad data. Used as the
-# max_decimal ceiling for spreads/totals only (moneyline can legitimately
-# go much further, e.g. a big favorite/underdog).
-SPREAD_TOTAL_MAX_DECIMAL = 3.2
+# TOTALS really are close to a coinflip by construction - the book sets
+# the total AT the point where over/under split roughly 50/50. Kept tight.
+TOTAL_MAX_DECIMAL = 3.2
+
+# SPREADS in MLB are NOT coinflip-shaped like NBA/NFL point spreads. MLB
+# books post a FIXED run line (almost always +/-1.5) rather than moving
+# the point to equalize the two sides' probabilities - so the PRICE
+# swings wide instead. A heavy moneyline favorite giving 1.5 runs can
+# easily be a real, honest 2.5-4.0+ decimal (25-40% implied) on the -1.5
+# side, while the underdog taking +1.5 sits at 1.3-1.6 decimal. This is
+# normal, not bad data - see The Odds API's own published MLB example
+# (Twins +1.5 at -200/1.50 decimal vs Mariners -1.5 at +170/2.70
+# decimal). The old tight ~3.2 ceiling was flagging real book prices as
+# bugs. Set generously higher; still guards against genuinely broken
+# data (a stale/glitched quote north of 6-7 decimal on a 2-outcome
+# spread market).
+SPREAD_MAX_DECIMAL = 6.5
+
+# Backward-compat alias in case anything else still references the old
+# combined name.
+SPREAD_TOTAL_MAX_DECIMAL = TOTAL_MAX_DECIMAL
 
 
 
@@ -261,8 +273,8 @@ def get_market_lines_for_event(event, home_team, away_team):
                         spread_points.add(outcome["point"])
     spreads_out = []
     for point in sorted(spread_points):
-        home_price = _book_price(bookmakers, "spreads", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
-        away_price = _book_price(bookmakers, "spreads", point=-point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
+        home_price = _book_price(bookmakers, "spreads", point=point, max_decimal=SPREAD_MAX_DECIMAL)
+        away_price = _book_price(bookmakers, "spreads", point=-point, max_decimal=SPREAD_MAX_DECIMAL)
         if home_team in home_price and away_team in away_price:
             spreads_out.append({
                 "point": point,
@@ -283,7 +295,7 @@ def get_market_lines_for_event(event, home_team, away_team):
                         total_points.add(outcome["point"])
     totals_out = []
     for point in sorted(total_points):
-        price = _book_price(bookmakers, "totals", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
+        price = _book_price(bookmakers, "totals", point=point, max_decimal=TOTAL_MAX_DECIMAL)
         if "Over" in price and "Under" in price:
             totals_out.append({
                 "point": point,
@@ -934,6 +946,13 @@ def strikeout_floor_probs(k_list, thresholds=None):
 # only as a fallback if we can't compute a live league average from today's data)
 LEAGUE_AVG_K_PER_GAME_FALLBACK = 8.6
 
+# Rough modern-era MLB league-average OPS, used only as a fallback when a
+# league-wide average can't be computed from the day's actual teams (e.g.
+# very early season, API hiccup). Recomputed live from every team playing
+# today wherever possible instead (see build_report), so this is a last
+# resort, not the primary source of truth.
+LEAGUE_AVG_OPS_FALLBACK = 0.715
+
 def get_team_k_rate(team_id, season=None):
     """Team's strikeouts-as-batter per game (how often this lineup whiffs)."""
     if season is None:
@@ -1111,6 +1130,15 @@ def get_pitcher_platoon_splits(pitcher_id, season=None):
 # ---------- team run scoring / allowing (for spread model) ----------
 
 def get_team_run_stats(team_id, season=None):
+    """
+    Returns season runs_scored_pg / runs_allowed_pg AND team OPS
+    (on-base + slugging), the latter as a batter-strength signal
+    independent of runs actually crossing the plate. Runs-scored-per-game
+    is a noisy proxy for offense (it's shaped by opponent pitching,
+    sequencing luck, park, etc.) - OPS reflects the batting order's true
+    quality more directly and is what spread_cover_prob/total_runs_prob
+    now blend in as BATTER_STRENGTH_WEIGHT.
+    """
     if season is None:
         season = datetime.utcnow().year
     try:
@@ -1123,11 +1151,14 @@ def get_team_run_stats(team_id, season=None):
         return None
     runs_scored = None
     games = None
+    ops = None
     try:
         stat = data["stats"][0]["splits"][0]["stat"]
         runs_scored = int(stat.get("runs", 0))
         games = int(stat.get("gamesPlayed", 1))
-    except (KeyError, IndexError, TypeError):
+        ops_raw = stat.get("ops")
+        ops = float(ops_raw) if ops_raw not in (None, "", "-.--") else None
+    except (KeyError, IndexError, TypeError, ValueError):
         pass
 
     try:
@@ -1150,6 +1181,7 @@ def get_team_run_stats(team_id, season=None):
     return {
         "runs_scored_pg": runs_scored / games,
         "runs_allowed_pg": runs_allowed / games,
+        "ops": ops,
     }
 
 
@@ -1268,11 +1300,66 @@ def blended_runs_allowed(season_allowed, recent, pitcher_form, bullpen, fatigue)
     return round(sum(v * w for v, w in components) / total_weight, 2)
 
 
-def blended_runs_scored(season_scored, recent):
-    """Shared blend used by both spread_cover_prob and total_runs_prob."""
+def batter_strength_scale(team_ops, league_avg_ops):
+    """
+    Converts team OPS into a scoring-level multiplier centered on 1.0 at
+    league average. Runs-scored-per-game already captures SOME of a
+    lineup's quality, but it's noisy - shaped by opposing pitching faced,
+    sequencing/luck, and park effects already baked into the season
+    number. OPS (on-base + slugging) is a more direct measure of the
+    batting order's true underlying quality, independent of who they
+    happened to face.
+
+    Uses a dampened (sqrt) ratio, same pattern as park_scoring_scale,
+    since a raw linear OPS ratio would overstate the swing - a lineup at
+    .800 OPS vs a league average of .715 doesn't score 12% more runs,
+    real-world run scoring responds less than linearly to OPS gaps due
+    to diminishing returns (extra baserunners without matching power,
+    etc). UNFITTED CONSTANT: dampening choice, not backtested against
+    settled results - directional, not gospel.
+
+    Returns 1.0 (no adjustment) if OPS data is missing for either side,
+    since a stat we don't have shouldn't silently pull the estimate one
+    way or the other.
+    """
+    if not team_ops or not league_avg_ops:
+        return 1.0
+    ratio = team_ops / league_avg_ops
+    if ratio <= 0:
+        return 1.0
+    return ratio ** 0.5
+
+
+# How much weight batter strength (OPS-derived) gets versus the
+# runs_scored_pg blend it's applied on top of. Applied as a multiplicative
+# scale (see batter_strength_scale), not another additive component in
+# blended_runs_allowed's weighted-average pattern, since OPS speaks to
+# scoring LEVEL/quality, not a separate independent estimate of the same
+# runs_scored_pg quantity - multiplying keeps it from double-counting
+# against the season/recent runs numbers it's refining.
+BATTER_STRENGTH_WEIGHT = 0.5  # 0 = ignore OPS entirely, 1 = full dampened-ratio scale applied
+
+
+def blended_runs_scored(season_scored, recent, team_ops=None, league_avg_ops=None):
+    """
+    Shared blend used by both spread_cover_prob and total_runs_prob.
+    Season/recent runs are blended first (as before), then scaled by the
+    team's batter strength (OPS vs league average) at BATTER_STRENGTH_WEIGHT -
+    a lineup hitting well above league-average OPS nudges the runs
+    estimate up beyond what season/recent runs alone captured, and vice
+    versa for a weak lineup. Missing OPS data leaves the estimate
+    unchanged (scale defaults to 1.0).
+    """
     if recent and recent.get("runs_scored_pg") is not None:
-        return round(season_scored * 0.7 + recent["runs_scored_pg"] * 0.3, 2)
-    return season_scored
+        base = round(season_scored * 0.7 + recent["runs_scored_pg"] * 0.3, 2)
+    else:
+        base = season_scored
+    scale = batter_strength_scale(team_ops, league_avg_ops)
+    # Dampen how much of the multiplier actually gets applied, per
+    # BATTER_STRENGTH_WEIGHT, rather than either ignoring OPS or applying
+    # the full computed scale outright.
+    effective_scale = 1.0 + (scale - 1.0) * BATTER_STRENGTH_WEIGHT
+    return round(base * effective_scale, 2)
 
 
 def park_scoring_scale(park_run_factor):
@@ -1292,13 +1379,15 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
                        pitcher_a_form=None, pitcher_b_form=None, pitcher_a_fatigue=None,
                        pitcher_b_fatigue=None, league_avg_era=4.20,
                        team_a_recent=None, team_b_recent=None,
-                       bullpen_a=None, bullpen_b=None, weather_a=None):
+                       bullpen_a=None, bullpen_b=None, weather_a=None,
+                       league_avg_ops=None):
     """
     Estimate P(team_a covers `spread`) using a normal approximation of MLB
     run-differential margin.
 
     Blend inputs (each optional, gracefully degrading if missing):
-      - team_x_stats: full-season runs_scored_pg / runs_allowed_pg (baseline)
+      - team_x_stats: full-season runs_scored_pg / runs_allowed_pg (baseline),
+        plus team OPS as a batter-strength signal (see blended_runs_scored)
       - team_x_recent: last-~12-game runs trend (get_team_recent_run_trend)
       - pitcher_x_form: probable starter's last-5-start ERA
       - bullpen_x: team staff ERA proxy (get_bullpen_recent_form)
@@ -1307,6 +1396,9 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
 
     spread is from team_a's perspective. std_dev ~4.2 runs is an approximate
     MLB single-game margin std dev. park_run_factor: venue R factor (100=neutral).
+    league_avg_ops: today's slate-wide average team OPS, used to judge
+    whether team_a/team_b's OPS is above/below average (see
+    batter_strength_scale); falls back to LEAGUE_AVG_OPS_FALLBACK if None.
 
     PARK FACTOR APPLIES TWICE, TO TWO DIFFERENT THINGS:
       1. It shifts the expected LEVEL of scoring itself (both teams'
@@ -1321,12 +1413,18 @@ def spread_cover_prob(team_a_stats, team_b_stats, spread, park_run_factor=100, s
     if not team_a_stats or not team_b_stats:
         return None
 
+    league_ops = league_avg_ops or LEAGUE_AVG_OPS_FALLBACK
+
     a_runs_allowed = blended_runs_allowed(
         team_a_stats["runs_allowed_pg"], team_a_recent, pitcher_a_form, bullpen_a, pitcher_a_fatigue)
     b_runs_allowed = blended_runs_allowed(
         team_b_stats["runs_allowed_pg"], team_b_recent, pitcher_b_form, bullpen_b, pitcher_b_fatigue)
-    a_runs_scored = blended_runs_scored(team_a_stats["runs_scored_pg"], team_a_recent)
-    b_runs_scored = blended_runs_scored(team_b_stats["runs_scored_pg"], team_b_recent)
+    a_runs_scored = blended_runs_scored(
+        team_a_stats["runs_scored_pg"], team_a_recent,
+        team_ops=team_a_stats.get("ops"), league_avg_ops=league_ops)
+    b_runs_scored = blended_runs_scored(
+        team_b_stats["runs_scored_pg"], team_b_recent,
+        team_ops=team_b_stats.get("ops"), league_avg_ops=league_ops)
 
     scoring_scale = park_scoring_scale(park_run_factor)
     a_runs_scored *= scoring_scale
@@ -1353,14 +1451,14 @@ def total_runs_prob(team_a_stats, team_b_stats, total_line, park_run_factor=100,
                      std_dev=5.6, pitcher_a_form=None, pitcher_b_form=None,
                      pitcher_a_fatigue=None, pitcher_b_fatigue=None,
                      team_a_recent=None, team_b_recent=None,
-                     bullpen_a=None, bullpen_b=None):
+                     bullpen_a=None, bullpen_b=None, league_avg_ops=None):
     """
     Estimate P(combined runs > total_line) using a normal approximation,
     same style as spread_cover_prob's z-score approach. Reuses the same
     blended_runs_allowed / blended_runs_scored / park_scoring_scale helpers
     as spread_cover_prob (see item 1's park-factor fix) rather than
-    duplicating that blend logic, so both markets react to park factor the
-    same way.
+    duplicating that blend logic, so both markets react to park factor -
+    and now batter strength (OPS) - the same way.
 
     Each team's expected run contribution = average of its own park-scaled
     scoring rate and the opponent's park-scaled rate of allowing runs (same
@@ -1370,16 +1468,25 @@ def total_runs_prob(team_a_stats, team_b_stats, total_line, park_run_factor=100,
     std_dev: MLB combined-game totals are a DIFFERENT, wider distribution
     than a single team's margin. UNFITTED CONSTANT: 5.6 runs, a separate,
     disclosed guess - not the margin model's 4.2, and not backtested.
+
+    league_avg_ops: today's slate-wide average team OPS (see
+    spread_cover_prob); falls back to LEAGUE_AVG_OPS_FALLBACK if None.
     """
     if not team_a_stats or not team_b_stats:
         return None
+
+    league_ops = league_avg_ops or LEAGUE_AVG_OPS_FALLBACK
 
     a_runs_allowed = blended_runs_allowed(
         team_a_stats["runs_allowed_pg"], team_a_recent, pitcher_a_form, bullpen_a, pitcher_a_fatigue)
     b_runs_allowed = blended_runs_allowed(
         team_b_stats["runs_allowed_pg"], team_b_recent, pitcher_b_form, bullpen_b, pitcher_b_fatigue)
-    a_runs_scored = blended_runs_scored(team_a_stats["runs_scored_pg"], team_a_recent)
-    b_runs_scored = blended_runs_scored(team_b_stats["runs_scored_pg"], team_b_recent)
+    a_runs_scored = blended_runs_scored(
+        team_a_stats["runs_scored_pg"], team_a_recent,
+        team_ops=team_a_stats.get("ops"), league_avg_ops=league_ops)
+    b_runs_scored = blended_runs_scored(
+        team_b_stats["runs_scored_pg"], team_b_recent,
+        team_ops=team_b_stats.get("ops"), league_avg_ops=league_ops)
 
     scoring_scale = park_scoring_scale(park_run_factor)
     a_runs_scored *= scoring_scale
@@ -1811,6 +1918,12 @@ def build_report():
     valid_k_rates = [v for v in team_k_cache.values() if v]
     league_avg_k = (sum(valid_k_rates) / len(valid_k_rates)) if valid_k_rates else LEAGUE_AVG_K_PER_GAME_FALLBACK
 
+    # Live slate-wide average team OPS, same pattern as league_avg_k above -
+    # judges each team's batter strength against what's actually happening
+    # across today's participating teams rather than a fixed guess.
+    valid_ops = [v["ops"] for v in team_run_stats_cache.values() if v and v.get("ops") is not None]
+    league_avg_ops = (sum(valid_ops) / len(valid_ops)) if valid_ops else LEAGUE_AVG_OPS_FALLBACK
+
     report = []
     for g in games:
         park = PARK_FACTORS.get(g["home_team_id"])
@@ -1973,6 +2086,7 @@ def build_report():
                 pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
                 team_a_recent=away_recent, team_b_recent=home_recent,
                 bullpen_a=away_bullpen, bullpen_b=home_bullpen, weather_a=game_weather,
+                league_avg_ops=league_avg_ops,
             )
             p_home = spread_cover_prob(
                 home_stats, away_stats, -spread, park_run_factor=park_r_factor,
@@ -1980,6 +2094,7 @@ def build_report():
                 pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue,
                 team_a_recent=home_recent, team_b_recent=away_recent,
                 bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
+                league_avg_ops=league_avg_ops,
             )
             # "spread" here is always the AWAY team's perspective point (e.g.
             # away +1.5 means home -1.5). home_cover_prob is computed at the
@@ -2000,6 +2115,7 @@ def build_report():
             pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
             team_a_recent=away_recent, team_b_recent=home_recent,
             bullpen_a=away_bullpen, bullpen_b=home_bullpen, weather_a=game_weather,
+            league_avg_ops=league_avg_ops,
         )
         ml_home = spread_cover_prob(
             home_stats, away_stats, 0, park_run_factor=park_r_factor,
@@ -2007,6 +2123,7 @@ def build_report():
             pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue,
             team_a_recent=home_recent, team_b_recent=away_recent,
             bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
+            league_avg_ops=league_avg_ops,
         )
         entry["moneyline"] = {"away_win_prob": ml_away, "home_win_prob": ml_home}
 
@@ -2022,6 +2139,7 @@ def build_report():
             pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
             team_a_recent=away_recent, team_b_recent=home_recent,
             bullpen_a=away_bullpen, bullpen_b=home_bullpen,
+            league_avg_ops=league_avg_ops,
         )
         total_runs_lines = []
         if total_probe:
@@ -2041,6 +2159,7 @@ def build_report():
                     pitcher_a_fatigue=away_pitcher_fatigue, pitcher_b_fatigue=home_pitcher_fatigue,
                     team_a_recent=away_recent, team_b_recent=home_recent,
                     bullpen_a=away_bullpen, bullpen_b=home_bullpen,
+                    league_avg_ops=league_avg_ops,
                 )
                 if result:
                     total_runs_lines.append(result)
@@ -2110,165 +2229,115 @@ def _render_empty_state():
     </div>"""
 
 
-MIN_EDGE_POINTS = 5.0   # minimum model-vs-market edge (percentage points) to surface a pick
-MAX_EDGE_POINTS = 25.0  # a real book doesn't leave an edge bigger than this on a spread/total -
-                        # above it, treat as a bug signal (model/market mismatch) rather than a find
-TOP_PICKS_LIMIT = 20    # cap on total picks shown, not games
+MIN_CONFIDENCE_POINTS = 5.0   # minimum model confidence above a coinflip (percentage points) to surface a pick
+TOP_PICKS_LIMIT = 20          # cap on total picks shown, not games
 
 
-def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
+def extract_top_picks(report, min_confidence=MIN_CONFIDENCE_POINTS, limit=TOP_PICKS_LIMIT):
     """
-    Scans every game for spread and total lines where BOTH a model
-    probability AND a RAW market price exist (straight from the book,
-    house margin included - no de-vigging), and keeps only the ones
-    where the model beats the market's raw implied probability by at
-    least `min_edge` percentage points. This replaces the old "model
-    confidence alone" approach entirely - a bare model probability with
-    nothing to compare it against is not surfaced here at all, no matter
-    how high it is.
+    Scans every game for spread and total lines where the model has a
+    real probability, and keeps the ones where the model's own
+    confidence sits at least `min_confidence` percentage points away
+    from a coinflip (50%). This is the model's own fair-value read,
+    nothing else - it does NOT compare against any sportsbook's price.
 
-    No player props, no bet builders, no moneyline/YRFI - spread and
-    total only, per the decision to focus exclusively on markets where a
-    real, checkable market price exists via the free odds feed.
+    Market-line comparison was removed on purpose: this script fetched
+    odds from one specific book (DraftKings via The Odds API's free
+    tier), which most people using this report don't actually bet at -
+    a "model vs. market" edge computed against a book you don't use
+    isn't something you can act on, and it made every MLB run-line quirk
+    (see SPREAD_MAX_DECIMAL) look like a bug rather than the book's
+    honest wide-run-line pricing. Simpler and more honest: this shows
+    ONLY the model's own probability and fair decimal odds. Open your
+    own book and compare its actual price against what's shown here
+    yourself.
 
-    Each pick includes the model's implied decimal odds and the book's
-    actual posted decimal odds side by side, so the gap is visible at a
-    glance and directly usable for staking.
+    No player props, no bet builders, no moneyline/YRFI here - spread
+    and total only, same scope as before.
     """
     picks = []
 
     for g in report:
         matchup = f'{g["away_team"]} @ {g["home_team"]}'
-        market = g.get("market") or {}
 
         # --- spread ---
-        # Each market.spreads entry is keyed by the HOME team's book point
-        # and holds BOTH sides' raw prob/decimal (home_prob/away_prob,
-        # home_decimal/away_decimal) together - it's one two-way market, not
-        # two separate entries. So both home and away picks pull from the
-        # SAME entry; there's no separate "away point" entry to look up.
-        market_spreads = {s["point"]: s for s in market.get("spreads", [])}
         for s in g.get("spread_lines", []):
             away_point = s["spread"]  # s["spread"] is always the AWAY team's perspective point
-            home_point = -away_point  # market_spreads is keyed by the home point
-            market_entry_for_line = market_spreads.get(home_point)
-            for side_label, model_prob, market_prob_key, market_dec_key, line_point in (
-                (g["home_team"], s.get("home_cover_prob"), "home_prob", "home_decimal", home_point),
-                (g["away_team"], s.get("away_cover_prob"), "away_prob", "away_decimal", away_point),
+            home_point = -away_point
+            for side_label, model_prob, line_point in (
+                (g["home_team"], s.get("home_cover_prob"), home_point),
+                (g["away_team"], s.get("away_cover_prob"), away_point),
             ):
-                market_entry = market_entry_for_line
-                if model_prob is None or not market_entry:
+                if model_prob is None:
                     continue
-                market_prob = market_entry.get(market_prob_key)
-                market_decimal = market_entry.get(market_dec_key)
-                edge = calc_edge(model_prob, market_prob)
-                # Sanity backstop, not a fix: a real MLB run-line point is
-                # essentially always within ±3.5, and a legitimate model
-                # OR market probability on a spread this close almost never
-                # sits outside a moderate range - a real book keeps both
-                # sides of a spread/total close to a coinflip by design.
-                # Values outside these bounds indicate a matching/unit bug
-                # or bad market data upstream (log and skip, don't display).
+                # Sanity backstop: a real MLB run-line point is
+                # essentially always within +/-3.5, and a model
+                # probability pinned at the extreme (>=97% or <=3%) on a
+                # single-game spread almost always means a bad/missing
+                # input upstream rather than genuine certainty.
                 if abs(line_point) > 3.5:
                     print(f"BUG SIGNAL: skipping spread pick with implausible point {line_point} ({matchup})")
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
                     print(f"BUG SIGNAL: skipping spread pick with implausible model_prob {model_prob} ({matchup})")
                     continue
-                if market_prob is None or market_prob >= 0.70 or market_prob <= 0.30:
-                    print(f"BUG SIGNAL: skipping spread pick with implausible market_prob {market_prob} ({matchup})")
-                    continue
-                # A real, honest model-vs-market gap on a spread is a few
-                # points, occasionally into the teens on a genuine mismatch.
-                # An edge this large (MAX_EDGE_POINTS+) with both inputs
-                # individually "plausible" is still much more likely to
-                # mean the model and market are quietly talking about
-                # different things than that the model found free money -
-                # a real sportsbook does not leave a 30+ point edge on the
-                # board. Log it as a bug signal rather than a pick.
-                if edge is not None and edge > MAX_EDGE_POINTS:
-                    print(f"BUG SIGNAL: skipping spread pick with implausible edge {edge} ({matchup})")
-                    continue
-                if edge is not None and edge >= min_edge:
+                confidence = abs(model_prob - 0.5) * 100
+                if confidence >= min_confidence:
                     picks.append({
                         "matchup": matchup,
                         "type": "Spread",
                         "side": side_label,
                         "line_label": f'{side_label} {line_point:+}',
                         "model_prob": model_prob,
-                        "market_prob": market_prob,
                         "model_decimal": prob_to_decimal_odds(model_prob),
-                        "market_decimal": market_decimal,
-                        "edge_points": edge,
+                        "confidence_points": round(confidence, 1),
                     })
 
         # --- total ---
-        market_totals = {t["point"]: t for t in market.get("totals", [])}
         for tr in g.get("total_runs", []):
             line = tr.get("line")
-            market_entry = market_totals.get(line)
-            if not market_entry:
-                continue
-            for side_label, model_prob, market_prob_key, market_dec_key in (
-                ("Over", tr.get("over_prob"), "over_prob", "over_decimal"),
-                ("Under", tr.get("under_prob"), "under_prob", "under_decimal"),
+            for side_label, model_prob in (
+                ("Over", tr.get("over_prob")),
+                ("Under", tr.get("under_prob")),
             ):
                 if model_prob is None:
                     continue
-                market_prob = market_entry.get(market_prob_key)
-                market_decimal = market_entry.get(market_dec_key)
-                edge = calc_edge(model_prob, market_prob)
-                # Same sanity backstop as spreads: real MLB totals run
-                # roughly 6-13, and neither the model NOR the market
-                # probability on a total should sit far from a coinflip -
-                # a real book keeps both sides close by design.
                 if not (6 <= line <= 13):
                     print(f"BUG SIGNAL: skipping total pick with implausible line {line} ({matchup})")
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
                     print(f"BUG SIGNAL: skipping total pick with implausible model_prob {model_prob} ({matchup})")
                     continue
-                if market_prob is None or market_prob >= 0.70 or market_prob <= 0.30:
-                    print(f"BUG SIGNAL: skipping total pick with implausible market_prob {market_prob} ({matchup})")
-                    continue
-                if edge is not None and edge > MAX_EDGE_POINTS:
-                    print(f"BUG SIGNAL: skipping total pick with implausible edge {edge} ({matchup})")
-                    continue
-                if edge is not None and edge >= min_edge:
+                confidence = abs(model_prob - 0.5) * 100
+                if confidence >= min_confidence:
                     picks.append({
                         "matchup": matchup,
                         "type": "Total",
                         "side": side_label,
                         "line_label": f'{side_label} {line}',
                         "model_prob": model_prob,
-                        "market_prob": market_prob,
                         "model_decimal": prob_to_decimal_odds(model_prob),
-                        "market_decimal": market_decimal,
-                        "edge_points": edge,
+                        "confidence_points": round(confidence, 1),
                     })
 
-    picks.sort(key=lambda x: x["edge_points"], reverse=True)
+    picks.sort(key=lambda x: x["confidence_points"], reverse=True)
     return picks[:limit]
 
 
-def _render_top_picks(picks, market_data_available):
-    """
-    Renders the picks section: every entry here has a real sportsbook
-    price behind it and a model probability that beats it by at least
-    MIN_EDGE_POINTS. No confidence-only picks, no props, no parlays.
-    """
-    if not market_data_available:
-        return """
-    <section class="top-picks">
-      <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">No market odds data available today - either the ODDS_API_KEY isn't set, or the odds fetch failed. Without a real sportsbook price to compare against, no picks can be shown; a bare model number isn't a pick.</p>
-    </section>"""
 
+def _render_top_picks(picks):
+    """
+    Renders the picks section: every entry here is purely the model's own
+    read - a fair probability and the decimal odds implied by it, ranked
+    by how far from a coinflip (50%) the model's confidence sits. No
+    sportsbook price is fetched or compared here; open your own book and
+    compare its actual line against what's shown.
+    """
     if not picks:
         return """
     <section class="top-picks">
       <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">No spread or total today cleared the minimum model-vs-market edge. That's a normal, honest outcome - it means the books' prices already line up closely with the model's own numbers, so there's no real edge to bet. No picks is a valid result, not a bug.</p>
+      <p class="top-picks-sub">No spread or total today cleared the minimum model confidence threshold. That's a normal, honest outcome - it means the model itself doesn't see a strong lean either way today. No picks is a valid result, not a bug.</p>
     </section>"""
 
     rows = []
@@ -2277,20 +2346,15 @@ def _render_top_picks(picks, market_data_available):
       <div class="pick-card">
         <div class="pick-card-top">
           <span class="pick-type">{pk["type"]}</span>
-          <span class="pick-prob">+{pk["edge_points"]:.1f} pts edge</span>
+          <span class="pick-prob">{pk["model_prob"]*100:.1f}%</span>
         </div>
         <p class="pick-player">{pk["matchup"]}</p>
         <p class="pick-line">{pk["line_label"]}</p>
         <div class="odds-compare">
           <div class="odds-col">
-            <span class="odds-col-label">model</span>
+            <span class="odds-col-label">model fair odds</span>
             <span class="odds-col-value">{pk["model_decimal"]}</span>
             <span class="odds-col-sub">{pk["model_prob"]*100:.1f}%</span>
-          </div>
-          <div class="odds-col">
-            <span class="odds-col-label">market</span>
-            <span class="odds-col-value">{pk["market_decimal"]}</span>
-            <span class="odds-col-sub">{pk["market_prob"]*100:.1f}%</span>
           </div>
         </div>
       </div>""")
@@ -2298,6 +2362,7 @@ def _render_top_picks(picks, market_data_available):
     return f"""
     <section class="top-picks">
       <h2 class="top-picks-title">today's picks</h2>
+      <p class="top-picks-sub">Model's own fair probability and implied decimal odds, ranked by confidence. No sportsbook price is used here - compare against whatever book you actually have open.</p>
       <div class="pick-grid">
         {''.join(rows)}
       </div>
@@ -2305,9 +2370,8 @@ def _render_top_picks(picks, market_data_available):
 
 
 def render_html(report):
-    market_data_available = any(g.get("market") for g in report)
     top_picks = extract_top_picks(report)
-    top_picks_html = _render_top_picks(top_picks, market_data_available)
+    top_picks_html = _render_top_picks(top_picks)
     cards = []
     for g in report:
         block = []
