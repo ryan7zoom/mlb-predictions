@@ -111,6 +111,182 @@ def team_nickname(team_id, fallback_name=None):
     return fallback_name
 
 
+# ---------- sportsbook odds (The Odds API) ----------
+#
+# Free tier: 500 credits/month, no card required. One call to the /odds
+# endpoint below with markets=h2h,spreads,totals costs a handful of credits
+# for the WHOLE day's MLB slate (cost = markets x regions, not per-game), so
+# a once-daily run comfortably fits the free quota for the full season.
+#
+# Docs: https://the-odds-api.com/liveapi/guides/v4/
+#
+# The key is read from the ODDS_API_KEY environment variable - set it as a
+# GitHub Actions repo secret (Settings -> Secrets and variables -> Actions),
+# never hardcode it here.
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
+
+
+def get_mlb_odds():
+    """
+    Fetches today's MLB odds board (moneyline, spreads, totals) from The
+    Odds API, one call for the whole slate. Returns the raw list of event
+    objects, or None if the key is missing or the call fails - callers
+    must treat None as "no market data available today" and say so
+    honestly rather than silently falling back to model-only numbers
+    labeled as if they were market-checked.
+    """
+    if not ODDS_API_KEY:
+        return None
+    url = (f"{ODDS_API_BASE}/sports/baseball_mlb/odds"
+           f"?regions=us&markets=h2h,spreads,totals&oddsFormat=decimal"
+           f"&apiKey={ODDS_API_KEY}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"WARNING: odds fetch failed ({e}) - proceeding without market data")
+        return None
+
+
+def _remove_vig_two_way(decimal_odds_a, decimal_odds_b):
+    """
+    Converts a pair of two-way decimal odds into de-vigged ("fair") implied
+    probabilities that sum to exactly 1.0.
+    """
+    if not decimal_odds_a or not decimal_odds_b or decimal_odds_a <= 1 or decimal_odds_b <= 1:
+        return None, None
+    raw_a = 1 / decimal_odds_a
+    raw_b = 1 / decimal_odds_b
+    overround = raw_a + raw_b
+    if overround <= 0:
+        return None, None
+    return raw_a / overround, raw_b / overround
+
+
+def _average_book_prices(bookmakers, market_key, point=None):
+    """
+    Averages decimal price for each outcome across all books offering
+    market_key (and matching `point` for spreads/totals). Returns
+    {outcome_name: avg_decimal_price}.
+    """
+    sums = {}
+    counts = {}
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            if market.get("key") != market_key:
+                continue
+            for outcome in market.get("outcomes", []):
+                if point is not None and outcome.get("point") != point:
+                    continue
+                name = outcome.get("name")
+                price = outcome.get("price")
+                if name is None or price is None:
+                    continue
+                sums[name] = sums.get(name, 0) + price
+                counts[name] = counts.get(name, 0) + 1
+    return {name: sums[name] / counts[name] for name in sums}
+
+
+def get_market_lines_for_event(event, home_team, away_team):
+    """
+    Pulls fair (de-vigged), book-averaged probabilities for h2h, spreads,
+    and totals out of one Odds API event object. Any market a book didn't
+    post today is simply absent, never guessed at.
+    """
+    bookmakers = event.get("bookmakers", [])
+    if not bookmakers:
+        return {}
+    result = {}
+
+    h2h_avg = _average_book_prices(bookmakers, "h2h")
+    if home_team in h2h_avg and away_team in h2h_avg:
+        home_prob, away_prob = _remove_vig_two_way(h2h_avg[home_team], h2h_avg[away_team])
+        if home_prob is not None:
+            result["h2h"] = {
+                "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
+                "home_decimal": round(h2h_avg[home_team], 3), "away_decimal": round(h2h_avg[away_team], 3),
+            }
+
+    spread_points = set()
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            if market.get("key") == "spreads":
+                for outcome in market.get("outcomes", []):
+                    if outcome.get("name") == home_team and outcome.get("point") is not None:
+                        spread_points.add(outcome["point"])
+    spreads_out = []
+    for point in sorted(spread_points):
+        avg = _average_book_prices(bookmakers, "spreads", point=point)
+        avg_away = _average_book_prices(bookmakers, "spreads", point=-point)
+        if home_team in avg and away_team in avg_away:
+            home_prob, away_prob = _remove_vig_two_way(avg[home_team], avg_away[away_team])
+            if home_prob is not None:
+                spreads_out.append({
+                    "point": point, "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
+                    "home_decimal": round(avg[home_team], 3), "away_decimal": round(avg_away[away_team], 3),
+                })
+    if spreads_out:
+        result["spreads"] = spreads_out
+
+    total_points = set()
+    for bm in bookmakers:
+        for market in bm.get("markets", []):
+            if market.get("key") == "totals":
+                for outcome in market.get("outcomes", []):
+                    if outcome.get("point") is not None:
+                        total_points.add(outcome["point"])
+    totals_out = []
+    for point in sorted(total_points):
+        avg = _average_book_prices(bookmakers, "totals", point=point)
+        if "Over" in avg and "Under" in avg:
+            over_prob, under_prob = _remove_vig_two_way(avg["Over"], avg["Under"])
+            if over_prob is not None:
+                totals_out.append({
+                    "point": point, "over_prob": round(over_prob, 4), "under_prob": round(under_prob, 4),
+                    "over_decimal": round(avg["Over"], 3), "under_decimal": round(avg["Under"], 3),
+                })
+    if totals_out:
+        result["totals"] = totals_out
+
+    return result
+
+
+def match_odds_event(odds_events, home_team_short, away_team_short):
+    """
+    The Odds API uses full team names while this script uses nicknames -
+    match on "nickname is contained in the API's full name".
+    """
+    if not odds_events:
+        return None
+    for event in odds_events:
+        api_home = event.get("home_team", "")
+        api_away = event.get("away_team", "")
+        if home_team_short in api_home and away_team_short in api_away:
+            return event
+    return None
+
+
+def prob_to_decimal_odds(prob):
+    """Fair decimal odds implied by a probability, e.g. 0.60 -> 1.67."""
+    if not prob or prob <= 0:
+        return None
+    return round(1 / prob, 2)
+
+
+def calc_edge(model_prob, market_prob):
+    """
+    Edge = model probability minus market fair probability, in percentage
+    points. A model probability with no market number to compare against
+    is not an edge, just an opinion.
+    """
+    if model_prob is None or market_prob is None:
+        return None
+    return round((model_prob - market_prob) * 100, 1)
+
+
 # ---------- low-level fetch ----------
 
 def get(path, params=None):
@@ -1563,6 +1739,7 @@ def build_batter_props_for_game(game, opp_pitcher_id_by_side):
 
 def build_report():
     games = get_todays_games()
+    odds_events = get_mlb_odds()
 
     # Compute a live league-average K/game across today's participating teams,
     # so the opponent adjustment is relative to current-season reality rather
@@ -1605,6 +1782,15 @@ def build_report():
             "spread_lines": [],
             "moneyline": None
         }
+
+        # Market odds for this game, if available today. Matched by team
+        # nickname; absent entirely (not zero/guessed) if the book hasn't
+        # posted lines yet or the odds fetch failed.
+        odds_event = match_odds_event(odds_events, g["home_team_short"], g["away_team_short"])
+        market = get_market_lines_for_event(
+            odds_event, odds_event.get("home_team"), odds_event.get("away_team")
+        ) if odds_event else {}
+        entry["market"] = market
 
         for side, pid, pname, opp_id, opp_name in [
             ("away", g["away_pitcher_id"], g["away_pitcher"], g["home_team_id"], g["home_team_short"]),
@@ -1728,7 +1914,15 @@ def build_report():
         away_pitcher_fatigue = next((p["fatigue"] for p in entry["pitchers"] if p["side"] == "away"), None)
         home_pitcher_fatigue = next((p["fatigue"] for p in entry["pitchers"] if p["side"] == "home"), None)
 
-        for spread in (-1.5, 1.5, 2.5):
+        # Test the model's default lines PLUS whatever spread point(s) the
+        # book actually posted (from the away side's perspective, i.e. the
+        # negation of the home-team point on the market board) - same
+        # reasoning as the totals fix above: edge detection needs a model
+        # number at the SAME point the market is offering.
+        spread_points_to_test = {-1.5, 1.5, 2.5}
+        for market_spread in entry.get("market", {}).get("spreads", []):
+            spread_points_to_test.add(-market_spread["point"])  # away-perspective point
+        for spread in sorted(spread_points_to_test):
             p_away = spread_cover_prob(
                 away_stats, home_stats, spread, park_run_factor=park_r_factor,
                 pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
@@ -1783,7 +1977,16 @@ def build_report():
         )
         total_runs_lines = []
         if total_probe:
-            for line in build_total_runs_lines(total_probe["expected_total"]):
+            # Test the model's own centered lines PLUS whatever line(s) the
+            # book actually posted today - the latter is what matters for
+            # edge detection (extract_top_picks only matches a model line
+            # against a market line at the SAME point), so if the book's
+            # posted total isn't one of the model's default guesses, it
+            # would never be checked against the market without this.
+            lines_to_test = set(build_total_runs_lines(total_probe["expected_total"]))
+            for market_total in entry.get("market", {}).get("totals", []):
+                lines_to_test.add(market_total["point"])
+            for line in sorted(lines_to_test):
                 result = total_runs_prob(
                     away_stats, home_stats, total_line=line, park_run_factor=park_r_factor,
                     pitcher_a_form=away_pitcher_form, pitcher_b_form=home_pitcher_form,
@@ -1816,11 +2019,6 @@ def build_report():
         entry["home_bullpen"] = home_bullpen
         entry["weather"] = game_weather
         entry["weather_description"] = describe_weather_effect(game_weather)
-
-        # Batter props (Section D) - only populated once lineups are
-        # posted; empty list is a normal, honest state earlier in the day.
-        opp_pitcher_id_by_side = {"away": g["away_pitcher_id"], "home": g["home_pitcher_id"]}
-        entry["batter_props"] = build_batter_props_for_game(g, opp_pitcher_id_by_side)
 
         report.append(entry)
     return report
@@ -1864,259 +2062,156 @@ def _render_empty_state():
     </div>"""
 
 
-CONFIDENCE_THRESHOLD = 0.75  # only picks at/above this become eligible for Top Picks
-TOP_PICKS_LIMIT = 8
+MIN_EDGE_POINTS = 5.0   # minimum model-vs-market edge (percentage points) to surface a pick
+TOP_PICKS_LIMIT = 20    # cap on total picks shown, not games
 
 
-def _lowest_safe_threshold(prob_dict, min_confidence=CONFIDENCE_THRESHOLD):
+def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
     """
-    Given {threshold: probability}, finds the LOWEST threshold whose
-    probability still clears min_confidence - i.e. the most conservative
-    line that's still basically a lock, not just whichever number happens
-    to be highest. A pitcher who hits 6+ K 90% of the time and 4+ K 99% of
-    the time should surface as "4+ K, 99%" here, not "6+ K, 90%" - the
-    safer floor, not the flashier one.
+    Scans every game for spread and total lines where BOTH a model
+    probability AND a real de-vigged market probability exist, and keeps
+    only the ones where the model beats the market by at least `min_edge`
+    percentage points. This replaces the old "model confidence alone"
+    approach entirely - a bare model probability with nothing to compare
+    it against is not surfaced here at all, no matter how high it is.
+
+    No player props, no bet builders, no moneyline/YRFI - spread and
+    total only, per the decision to focus exclusively on markets where a
+    real, checkable market price exists via the free odds feed.
+
+    Each pick includes the fair decimal odds implied by BOTH the model's
+    probability and the market's probability, so the gap is visible at a
+    glance and directly usable for staking.
     """
-    if not prob_dict:
-        return None
-    eligible = [(t, p) for t, p in prob_dict.items() if p is not None and p >= min_confidence]
-    if not eligible:
-        return None
-    # lowest threshold among those that clear the bar
-    t, p = min(eligible, key=lambda x: x[0])
-    return {"threshold": t, "prob": p}
-
-
-def extract_top_picks(report, min_confidence=CONFIDENCE_THRESHOLD, limit=TOP_PICKS_LIMIT):
-    """
-    Scans every game already computed for the day and pulls every pick
-    (pitcher strikeouts, batter props, team spread cover, moneyline) that
-    clears min_confidence, using the LOWEST threshold that still clears the
-    bar for floor-style props (not just the highest raw percentage on the
-    board). Picks are grouped by game, and a game is only included in the
-    output if it has AT LEAST 2 QUALIFYING PICKS - the point of this
-    section is bet builders (a.k.a. same-game parlays), which need 2+ legs
-    from the same game to combine. A single strong pick with no partner in
-    its own game doesn't help with that, so it's dropped rather than shown
-    as an island.
-
-    This reflects the model's own math only - it has not been backtested
-    against real settled results, so "safe" here means "the model is very
-    consistent about this," not "guaranteed to hit." Framed that way in
-    the UI, not hidden.
-
-    Returns a list of game-groups: [{"matchup": ..., "picks": [...]}, ...],
-    sorted by each game's best single pick probability, highest first, and
-    capped at `limit` games (not `limit` picks).
-    """
-    games = []
+    picks = []
 
     for g in report:
         matchup = f'{g["away_team"]} @ {g["home_team"]}'
-        game_picks = []
+        market = g.get("market") or {}
 
-        # --- pitcher strikeout floors ---
-        for p in g.get("pitchers", []):
-            best = _lowest_safe_threshold(p.get("floor_probabilities_final"), min_confidence)
-            if best:
-                reasons = []
-                if p.get("recent_k_values"):
-                    avg_k = round(sum(p["recent_k_values"]) / len(p["recent_k_values"]), 1)
-                    reasons.append(f"averaging {avg_k} strikeouts over his last {len(p['recent_k_values'])} starts")
-                if p.get("opponent_k_per_game"):
-                    trend_word = "lately" if p.get("opponent_k_source", "").startswith("recent") else "this season"
-                    reasons.append(f"{p['opponent']} strikes out {p['opponent_k_per_game']}/game {trend_word} "
-                                   f"(league average {p['league_avg_k_per_game']})")
-                flags = []
-                consistency = p.get("strikeout_consistency")
-                if consistency and consistency.get("note"):
-                    flags.append(consistency["note"])
-                game_picks.append({
-                    "type": "Strikeouts",
-                    "player": p["name"],
-                    "team_context": matchup,
-                    "pick_label": f'{best["threshold"]}+ strikeouts',
-                    "prob": best["prob"],
-                    "reasons": reasons,
-                    "flags": flags,
-                })
-
-        # --- batter props ---
-        for b in g.get("batter_props", []):
-            floors = b.get("floor_probabilities") or {}
-            thin_flags = b.get("thin_margin_flags") or {}
-            stat_labels = {"hits": "hits", "home_runs": "home runs", "rbi": "RBIs", "total_bases": "total bases"}
-            for stat_key, stat_label in stat_labels.items():
-                best = _lowest_safe_threshold(floors.get(stat_key), min_confidence)
-                if best:
-                    reasons = [f"hit this mark in {round(best['prob']*100)}% of his last {b['games_sampled']} games"]
-                    matchup_info = b.get("opponent_pitcher_matchup")
-                    if matchup_info:
-                        reasons.append(f"tonight's opposing pitcher has struggled against hitters like him "
-                                       f"({matchup_info['pitcher_k_rate_vs_this_handedness']*100:.0f}% strikeout rate faced)")
-                    flags = []
-                    if thin_flags.get(stat_key, {}).get(best["threshold"]):
-                        flags.append(f"THIN MARGIN - he usually just barely clears {best['threshold']}+ {stat_label}, not by much")
-                    game_picks.append({
-                        "type": stat_label.capitalize(),
-                        "player": b["name"],
-                        "team_context": matchup,
-                        "pick_label": f'{best["threshold"]}+ {stat_label}',
-                        "prob": best["prob"],
-                        "reasons": reasons,
-                        "flags": flags,
-                    })
-
-        # --- total runs (over/under) ---
-        best_total_per_side = {}
-        for tr in g.get("total_runs", []):
-            for side_label, prob, pick_label in (
-                ("Over", tr.get("over_prob"), f'Over {tr["line"]}'),
-                ("Under", tr.get("under_prob"), f'Under {tr["line"]}'),
-            ):
-                if prob is not None and prob >= min_confidence:
-                    candidate = {
-                        "type": "Total Runs",
-                        "player": matchup,
-                        "team_context": matchup,
-                        "pick_label": pick_label,
-                        "prob": prob,
-                        "reasons": [f"model projects {tr['expected_total']} combined runs tonight"],
-                        "flags": [],
-                    }
-                    if side_label not in best_total_per_side or prob > best_total_per_side[side_label]["prob"]:
-                        best_total_per_side[side_label] = candidate
-        game_picks.extend(best_total_per_side.values())
-
-        # --- team spread covers (best line per team, not every threshold) ---
-        best_spread_per_team = {}
+        # --- spread ---
+        market_spreads = {s["point"]: s for s in market.get("spreads", [])}
         for s in g.get("spread_lines", []):
-            for side_label, prob in ((g["away_team"], s.get("away_cover_prob")),
-                                      (g["home_team"], s.get("home_cover_prob"))):
-                if prob is not None and prob >= min_confidence:
-                    key = side_label
-                    candidate = {
+            point = s["spread"]
+            # market spreads are keyed by the HOME team's point; the model
+            # tests the same point for both sides, so match on home's line
+            # and its negation for away.
+            home_market = market_spreads.get(point)
+            away_market = market_spreads.get(-point)
+            for side_label, model_prob, market_entry, market_prob_key, market_dec_key in (
+                (g["home_team"], s.get("home_cover_prob"), home_market, "home_prob", "home_decimal"),
+                (g["away_team"], s.get("away_cover_prob"), away_market, "away_prob", "away_decimal"),
+            ):
+                if model_prob is None or not market_entry:
+                    continue
+                market_prob = market_entry.get(market_prob_key)
+                market_decimal = market_entry.get(market_dec_key)
+                edge = calc_edge(model_prob, market_prob)
+                if edge is not None and edge >= min_edge:
+                    picks.append({
+                        "matchup": matchup,
                         "type": "Spread",
-                        "player": side_label,
-                        "team_context": matchup,
-                        "pick_label": f'{s["spread"]:+} spread',
-                        "prob": prob,
-                        "reasons": [f"model favors {side_label} to cover {s['spread']:+} tonight"],
-                        "flags": [],
-                    }
-                    if key not in best_spread_per_team or prob > best_spread_per_team[key]["prob"]:
-                        best_spread_per_team[key] = candidate
-        game_picks.extend(best_spread_per_team.values())
-
-        # --- moneyline (straight-up win) ---
-        ml = g.get("moneyline")
-        if ml:
-            for side_label, prob in ((g["away_team"], ml.get("away_win_prob")),
-                                      (g["home_team"], ml.get("home_win_prob"))):
-                if prob is not None and prob >= min_confidence:
-                    game_picks.append({
-                        "type": "Moneyline",
-                        "player": side_label,
-                        "team_context": matchup,
-                        "pick_label": f'{side_label} to win',
-                        "prob": prob,
-                        "reasons": [f"model favors {side_label} to win outright tonight"],
-                        "flags": [],
+                        "side": side_label,
+                        "line_label": f'{side_label} {point:+}',
+                        "model_prob": model_prob,
+                        "market_prob": market_prob,
+                        "model_decimal": prob_to_decimal_odds(model_prob),
+                        "market_decimal": market_decimal,
+                        "edge_points": edge,
                     })
 
-        # --- YRFI / NRFI (run in the 1st inning, yes or no) ---
-        yn = g.get("yrfi_nrfi")
-        if yn:
-            for label, key in (("YRFI", "yrfi_prob"), ("NRFI", "nrfi_prob")):
-                prob = yn.get(key)
-                if prob is not None and prob >= min_confidence:
-                    game_picks.append({
-                        "type": "1st Inning",
-                        "player": matchup,
-                        "team_context": matchup,
-                        "pick_label": label,
-                        "prob": prob,
-                        "reasons": [f"model favors {label} ({'a run scores' if label == 'YRFI' else 'no run scores'} "
-                                    f"in the 1st) tonight"],
-                        "flags": [],
+        # --- total ---
+        market_totals = {t["point"]: t for t in market.get("totals", [])}
+        for tr in g.get("total_runs", []):
+            line = tr.get("line")
+            market_entry = market_totals.get(line)
+            if not market_entry:
+                continue
+            for side_label, model_prob, market_prob_key, market_dec_key in (
+                ("Over", tr.get("over_prob"), "over_prob", "over_decimal"),
+                ("Under", tr.get("under_prob"), "under_prob", "under_decimal"),
+            ):
+                if model_prob is None:
+                    continue
+                market_prob = market_entry.get(market_prob_key)
+                market_decimal = market_entry.get(market_dec_key)
+                edge = calc_edge(model_prob, market_prob)
+                if edge is not None and edge >= min_edge:
+                    picks.append({
+                        "matchup": matchup,
+                        "type": "Total",
+                        "side": side_label,
+                        "line_label": f'{side_label} {line}',
+                        "model_prob": model_prob,
+                        "market_prob": market_prob,
+                        "model_decimal": prob_to_decimal_odds(model_prob),
+                        "market_decimal": market_decimal,
+                        "edge_points": edge,
                     })
 
-
-        # Bed builder requirement: need 2+ picks from this game, or it's not
-        # useful for combining legs - drop games with only 0 or 1 qualifying pick.
-        if len(game_picks) >= 2:
-            game_picks.sort(key=lambda x: x["prob"], reverse=True)
-            games.append({
-                "matchup": matchup,
-                "best_prob": game_picks[0]["prob"],
-                "picks": game_picks,
-            })
-
-    games.sort(key=lambda x: x["best_prob"], reverse=True)
-    return games[:limit]
+    picks.sort(key=lambda x: x["edge_points"], reverse=True)
+    return picks[:limit]
 
 
-def _render_top_picks(games):
+def _render_top_picks(picks, market_data_available):
     """
-    Renders the Top Picks section as bet-builder groups: one block per
-    game, each containing 2+ qualifying picks (any mix of moneyline,
-    spread, pitcher props, batter props) that can be combined into a
-    same-game parlay / bet builder. Games sorted by their best single
-    pick's probability, highest first. Empty state shown honestly if no
-    game had 2+ qualifying picks today - that's a normal outcome on a day
-    with tougher matchups, not a bug.
+    Renders the picks section: every entry here has a real sportsbook
+    price behind it and a model probability that beats it by at least
+    MIN_EDGE_POINTS. No confidence-only picks, no props, no parlays.
     """
-    if not games:
+    if not market_data_available:
         return """
     <section class="top-picks">
-      <h2 class="top-picks-title">today's bet builders</h2>
-      <p class="top-picks-sub">No game had at least two picks clear our confidence bar today - that happens on days with tougher matchups. Check the full game breakdowns below instead.</p>
+      <h2 class="top-picks-title">today's picks</h2>
+      <p class="top-picks-sub">No market odds data available today - either the ODDS_API_KEY isn't set, or the odds fetch failed. Without a real sportsbook price to compare against, no picks can be shown; a bare model number isn't a pick.</p>
     </section>"""
 
-    game_blocks = []
-    for game in games:
-        rows = []
-        for pk in game["picks"]:
-            pct = pk["prob"] * 100
-            reasons_html = ""
-            if pk.get("reasons"):
-                reasons_html = '<ul class="pick-reasons">' + "".join(f"<li>{r}</li>" for r in pk["reasons"]) + "</ul>"
-            flags_html = ""
-            if pk.get("flags"):
-                flags_html = "".join(f'<div class="flag-chip flag-chip-inline">&#9888; {f}</div>' for f in pk["flags"])
-            rows.append(f"""
-          <div class="pick-card">
-            <div class="pick-card-top">
-              <span class="pick-type">{pk["type"]}</span>
-              <span class="pick-prob">{pct:.0f}%</span>
-            </div>
-            <p class="pick-player">{pk["player"]}</p>
-            <p class="pick-line">{pk["pick_label"]}</p>
-            {reasons_html}
-            {flags_html}
-          </div>""")
+    if not picks:
+        return """
+    <section class="top-picks">
+      <h2 class="top-picks-title">today's picks</h2>
+      <p class="top-picks-sub">No spread or total today cleared the minimum model-vs-market edge. That's a normal, honest outcome - it means the books' prices already line up closely with the model's own numbers, so there's no real edge to bet. No picks is a valid result, not a bug.</p>
+    </section>"""
 
-        game_blocks.append(f"""
-      <div class="bed-builder-group">
-        <h3 class="bed-builder-label">bet builder: {game["matchup"]}</h3>
-        <div class="pick-grid">
-          {''.join(rows)}
+    rows = []
+    for pk in picks:
+        rows.append(f"""
+      <div class="pick-card">
+        <div class="pick-card-top">
+          <span class="pick-type">{pk["type"]}</span>
+          <span class="pick-prob">+{pk["edge_points"]:.1f} pts edge</span>
+        </div>
+        <p class="pick-player">{pk["matchup"]}</p>
+        <p class="pick-line">{pk["line_label"]}</p>
+        <div class="odds-compare">
+          <div class="odds-col">
+            <span class="odds-col-label">model</span>
+            <span class="odds-col-value">{pk["model_decimal"]}</span>
+            <span class="odds-col-sub">{pk["model_prob"]*100:.1f}%</span>
+          </div>
+          <div class="odds-col">
+            <span class="odds-col-label">market</span>
+            <span class="odds-col-value">{pk["market_decimal"]}</span>
+            <span class="odds-col-sub">{pk["market_prob"]*100:.1f}%</span>
+          </div>
         </div>
       </div>""")
 
     return f"""
     <section class="top-picks">
-      <h2 class="top-picks-title">today's bet builders</h2>
-      <p class="top-picks-sub">Each group below has 2+ picks from the same game - moneyline, spread, and player props - so you can combine legs into a bet builder / same-game parlay. This reflects the model's own math, not a guarantee - always double-check before betting.</p>
-      {''.join(game_blocks)}
+      <h2 class="top-picks-title">today's picks</h2>
+      <p class="top-picks-sub">Spread and total only. Every pick below has a real sportsbook price (averaged across books, de-vigged) behind it, and the model's probability beats that market price by at least {MIN_EDGE_POINTS:.0f} points. Model decimal odds are what the model's probability implies; market decimal odds are what the book is actually offering - bet at the book's price, this is a comparison, not a guarantee.</p>
+      <div class="pick-grid">
+        {''.join(rows)}
+      </div>
     </section>"""
 
 
 def render_html(report):
+    market_data_available = any(g.get("market") for g in report)
     top_picks = extract_top_picks(report)
-    top_picks_html = _render_top_picks(top_picks)
+    top_picks_html = _render_top_picks(top_picks, market_data_available)
     cards = []
-    prop_cards = []
     for g in report:
         block = []
         block.append('<section class="matchup-card">')
@@ -2149,16 +2244,6 @@ def render_html(report):
                 block.append('</div>')
             block.append('</div>')
 
-        yn = g.get("yrfi_nrfi")
-        if yn and yn.get("yrfi_prob") is not None:
-            block.append('<h3 class="section-label">1st Inning (YRFI / NRFI)</h3>')
-            block.append('<div class="spread-block">')
-            block.append('<div class="spread-row-group">')
-            block.append(_prob_bar("YRFI (run scores)", yn["yrfi_prob"], "var(--teal)"))
-            block.append(_prob_bar("NRFI (no run)", yn["nrfi_prob"], "var(--orange)"))
-            block.append('</div>')
-            block.append('</div>')
-
         block.append('<ul class="why-list">')
         for label, recent, bullpen, form in (
             (g["away_team"], g.get("away_recent_trend"), g.get("away_bullpen"), g.get("away_pitcher_form")),
@@ -2179,122 +2264,8 @@ def render_html(report):
             block.append(f'<li>{g["weather_description"]}</li>')
         block.append('</ul>')
 
-        block.append('<h3 class="section-label">Starting Pitchers</h3>')
-        for p in g["pitchers"]:
-            side_label = g["away_team"] if p["side"] == "away" else g["home_team"]
-            block.append('<div class="player-block">')
-            block.append(f'<p class="player-name">{p["name"]} <span class="games-sampled">'
-                         f'{side_label}, facing {p["opponent"]} &middot; last {p["recent_starts_sampled"]} starts</span></p>')
-
-            fatigue = p.get("fatigue")
-            if fatigue and fatigue.get("note"):
-                block.append(f'<div class="flag-chip flag-chip-inline">&#9888; {fatigue["note"].capitalize()}.</div>')
-
-            il_check = p.get("il_check")
-            if il_check and il_check.get("flag"):
-                block.append(f'<div class="flag-chip flag-chip-inline">&#9888; This pitcher may be recently back '
-                             f'from an injury or a long break - worth double-checking before betting on him.</div>')
-
-            lineup_matchup = p.get("lineup_matchup")
-            if lineup_matchup:
-                if lineup_matchup.get("available"):
-                    block.append(f'<p class="vs-opp-line">{lineup_matchup["summary"]}</p>')
-                else:
-                    block.append(f'<p class="vs-opp-line vs-opp-empty">{lineup_matchup["reason"]}</p>')
-
-            platoon = p.get("platoon")
-            if platoon and platoon.get("k_rate_vs_lhb") is not None and platoon.get("k_rate_vs_rhb") is not None:
-                hand_word = "left-handed" if platoon.get("throws") == "L" else "right-handed"
-                block.append(f'<p class="vs-opp-line">Throws {hand_word} &middot; '
-                             f'strikes out left-handed batters {platoon["k_rate_vs_lhb"]*100:.0f}% of the time faced, '
-                             f'right-handed batters {platoon["k_rate_vs_rhb"]*100:.0f}% of the time</p>')
-
-            block.append('<ul class="why-list">')
-            block.append(f'<li>Strikeouts in his last {p["recent_starts_sampled"]} starts: '
-                         f'{p["recent_k_values"]}</li>')
-            if p.get("opponent_k_per_game"):
-                rank = p.get("opponent_k_league_rank")
-                rank_txt = f' - the {_ordinal(rank["rank"])} most strikeout-prone lineup out of {rank["of"]} teams playing today' if rank else ''
-                trend_word = "lately" if p.get("opponent_k_source","").startswith("recent") else "this season"
-                block.append(f'<li>{p["opponent"]} strikes out {p["opponent_k_per_game"]} times per game {trend_word} '
-                             f'(league average is {p["league_avg_k_per_game"]}){rank_txt}</li>')
-            if p.get("weather_description"):
-                block.append(f'<li>{p["weather_description"]}</li>')
-            k_per_ip = p.get("k_per_ip")
-            if k_per_ip:
-                block.append(f'<li>Strikes out {k_per_ip["k_per_ip"]} batters per inning pitched over his last '
-                             f'{k_per_ip["starts_sampled"]} starts (averaging {k_per_ip["avg_ip_per_start"]} IP/start)</li>')
-            block.append('</ul>')
-
-            consistency = p.get("strikeout_consistency")
-            if consistency and consistency.get("note"):
-                block.append(f'<div class="flag-chip flag-chip-inline">&#9888; {consistency["note"].capitalize()}.</div>')
-
-            block.append('<div class="stat-group">')
-            block.append('<span class="stat-group-label">Strikeouts</span>')
-            block.append('<div class="pill-row">')
-            for t, prob in p["floor_probabilities_final"].items():
-                pct = prob * 100
-                tier = "pill-hot" if pct >= 70 else ("pill-warm" if pct >= 40 else "pill-cool")
-                block.append(f'<span class="pill {tier}">{t}+ K &middot; {pct:.0f}%</span>')
-            block.append('</div>')
-            block.append('</div>')
-            block.append('</div>')
-
         block.append('</section>')
         cards.append("".join(block))
-
-        batter_props = g.get("batter_props") or []
-        if batter_props:
-            prop_block = []
-            prop_block.append('<section class="matchup-card">')
-            prop_block.append('<div class="matchup-header">')
-            prop_block.append('<div class="court-line"></div>')
-            prop_block.append(f'<h2>{g["away_team"]} <span class="at-sign">@</span> {g["home_team"]}</h2>')
-            prop_block.append('</div>')
-            prop_block.append('<h3 class="section-label">Player Props</h3>')
-            for b in batter_props:
-                side_label = g["away_team"] if b["side"] == "away" else g["home_team"]
-                hand_word = {"L": "left-handed", "R": "right-handed", "S": "switch-hitter"}.get(b.get("bat_side"), "")
-                hand_txt = f' &middot; {hand_word}' if hand_word else ''
-                prop_block.append('<div class="player-block">')
-                prop_block.append(f'<p class="player-name">{b["name"]} <span class="games-sampled">'
-                             f'{side_label}{hand_txt} &middot; last {b["games_sampled"]} games</span></p>')
-
-                il_check = b.get("il_check")
-                if il_check and il_check.get("flag"):
-                    prop_block.append(f'<div class="flag-chip flag-chip-inline">&#9888; This player may be recently back '
-                                 f'from an injury or a long break - worth double-checking before betting on him.</div>')
-
-                matchup = b.get("opponent_pitcher_matchup")
-                if matchup:
-                    prop_block.append(f'<p class="vs-opp-line">Tonight\'s opposing pitcher strikes out batters like him '
-                                 f'{matchup["pitcher_k_rate_vs_this_handedness"]*100:.0f}% of the time faced this season</p>')
-
-                splits = b.get("home_away_split")
-                if splits and splits.get("home_hits_per_game") is not None and splits.get("away_hits_per_game") is not None:
-                    prop_block.append(f'<p class="vs-opp-line">Hits/game: {splits["home_hits_per_game"]} at home '
-                                 f'({splits["home_games_sampled"]} gm) &middot; {splits["away_hits_per_game"]} away '
-                                 f'({splits["away_games_sampled"]} gm)</p>')
-
-                floors = b.get("floor_probabilities") or {}
-                for stat_key, stat_label in (("hits", "Hits"), ("home_runs", "HR"),
-                                              ("rbi", "RBI"), ("total_bases", "Total Bases")):
-                    thresholds = floors.get(stat_key)
-                    if not thresholds:
-                        continue
-                    prop_block.append('<div class="stat-group">')
-                    prop_block.append(f'<span class="stat-group-label">{stat_label}</span>')
-                    prop_block.append('<div class="pill-row">')
-                    for t, prob in thresholds.items():
-                        pct = prob * 100
-                        tier = "pill-hot" if pct >= 70 else ("pill-warm" if pct >= 40 else "pill-cool")
-                        prop_block.append(f'<span class="pill {tier}">{t}+ &middot; {pct:.0f}%</span>')
-                    prop_block.append('</div>')
-                    prop_block.append('</div>')
-                prop_block.append('</div>')
-            prop_block.append('</section>')
-            prop_cards.append("".join(prop_block))
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -2532,6 +2503,15 @@ h1 {{
   line-height: 1.5;
 }}
 .pick-reasons li {{ margin: 2px 0; }}
+.odds-compare {{ display: flex; gap: 10px; margin-top: 8px; }}
+.odds-col {{
+  flex: 1; background: var(--card-bg, rgba(255,255,255,0.03)); border-radius: 8px;
+  padding: 8px 10px; display: flex; flex-direction: column; align-items: center;
+}}
+.odds-col-label {{ font-size: 0.65em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); font-weight: 700; }}
+.odds-col-value {{ font-size: 1.3em; font-weight: 800; color: var(--text); margin-top: 2px; }}
+.odds-col-sub {{ font-size: 0.7em; color: var(--text-dim); margin-top: 1px; }}
+.section-divider {{ font-size: 1em; font-weight: 700; color: var(--text-dim); margin: 24px 20px 10px; text-transform: lowercase; }}
 
 .tab-nav {{
   display: grid;
@@ -2577,42 +2557,11 @@ h1 {{
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
 <p class="disclaimer">These are estimates, not guarantees — always double-check the actual odds at your sportsbook before betting. Numbers are directional (best-effort predictions), not scientifically proven locks.</p>
 
-<div class="tab-nav">
-  <button class="tab-card active" data-tab="tab-builders" onclick="showTab('tab-builders', this)">
-    <span class="tab-card-title">Bet Builders</span>
-    <span class="tab-card-sub">Same-game parlay picks</span>
-  </button>
-  <button class="tab-card" data-tab="tab-pitching" onclick="showTab('tab-pitching', this)">
-    <span class="tab-card-title">Game Lines &amp; Pitchers</span>
-    <span class="tab-card-sub">Spreads, YRFI/NRFI, starting pitchers</span>
-  </button>
-  <button class="tab-card" data-tab="tab-props" onclick="showTab('tab-props', this)">
-    <span class="tab-card-title">Player Props</span>
-    <span class="tab-card-sub">Hits, HR, RBI, total bases</span>
-  </button>
-</div>
-
-<div id="tab-builders" class="tab-panel active">
 {top_picks_html}
-</div>
 
-<div id="tab-pitching" class="tab-panel">
+<h2 class="section-divider">All games: spread &amp; total detail</h2>
 {_render_empty_state() if not cards else ''.join(cards)}
-</div>
 
-<div id="tab-props" class="tab-panel">
-{''.join(prop_cards) if prop_cards else '<p class="disclaimer">No player prop data available today.</p>'}
-</div>
-
-<script>
-function showTab(id, btn) {{
-  document.querySelectorAll('.tab-panel').forEach(function(p) {{ p.classList.remove('active'); }});
-  document.querySelectorAll('.tab-card').forEach(function(c) {{ c.classList.remove('active'); }});
-  document.getElementById(id).classList.add('active');
-  btn.classList.add('active');
-  window.scrollTo({{ top: 0, behavior: 'instant' }});
-}}
-</script>
 </body>
 </html>"""
     return html
