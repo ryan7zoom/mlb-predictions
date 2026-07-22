@@ -1931,12 +1931,16 @@ def build_report():
                 bullpen_a=away_bullpen, bullpen_b=home_bullpen, weather_a=game_weather,
             )
             p_home = spread_cover_prob(
-                home_stats, away_stats, spread, park_run_factor=park_r_factor,
+                home_stats, away_stats, -spread, park_run_factor=park_r_factor,
                 pitcher_a_form=home_pitcher_form, pitcher_b_form=away_pitcher_form,
                 pitcher_a_fatigue=home_pitcher_fatigue, pitcher_b_fatigue=away_pitcher_fatigue,
                 team_a_recent=home_recent, team_b_recent=away_recent,
                 bullpen_a=home_bullpen, bullpen_b=away_bullpen, weather_a=game_weather,
             )
+            # "spread" here is always the AWAY team's perspective point (e.g.
+            # away +1.5 means home -1.5). home_cover_prob is computed at the
+            # negated point (-spread) since spread_cover_prob's `spread` arg
+            # is from team_a's perspective and team_a=home in that call.
             entry["spread_lines"].append({
                 "spread": spread,
                 "away_cover_prob": p_away,
@@ -2092,27 +2096,38 @@ def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
         # --- spread ---
         market_spreads = {s["point"]: s for s in market.get("spreads", [])}
         for s in g.get("spread_lines", []):
-            point = s["spread"]
-            # market spreads are keyed by the HOME team's point; the model
-            # tests the same point for both sides, so match on home's line
-            # and its negation for away.
-            home_market = market_spreads.get(point)
-            away_market = market_spreads.get(-point)
-            for side_label, model_prob, market_entry, market_prob_key, market_dec_key in (
-                (g["home_team"], s.get("home_cover_prob"), home_market, "home_prob", "home_decimal"),
-                (g["away_team"], s.get("away_cover_prob"), away_market, "away_prob", "away_decimal"),
+            away_point = s["spread"]  # s["spread"] is always the AWAY team's perspective point
+            # market_spreads is keyed by the HOME team's book point, so the
+            # away point must be negated to look up home's market line, and
+            # matched directly (no negation) to look up away's market line.
+            home_market = market_spreads.get(-away_point)
+            away_market = market_spreads.get(away_point)
+            for side_label, model_prob, market_entry, market_prob_key, market_dec_key, line_point in (
+                (g["home_team"], s.get("home_cover_prob"), home_market, "home_prob", "home_decimal", -away_point),
+                (g["away_team"], s.get("away_cover_prob"), away_market, "away_prob", "away_decimal", away_point),
             ):
                 if model_prob is None or not market_entry:
                     continue
                 market_prob = market_entry.get(market_prob_key)
                 market_decimal = market_entry.get(market_dec_key)
                 edge = calc_edge(model_prob, market_prob)
+                # Sanity backstop, not a fix: a real MLB run-line point is
+                # essentially always within ±3.5, and a legitimate model
+                # probability on a spread this close almost never saturates
+                # to near-certain. Values outside these bounds indicate a
+                # matching/unit bug upstream (log and skip, don't display).
+                if abs(line_point) > 3.5:
+                    print(f"BUG SIGNAL: skipping spread pick with implausible point {line_point} ({matchup})")
+                    continue
+                if model_prob >= 0.97 or model_prob <= 0.03:
+                    print(f"BUG SIGNAL: skipping spread pick with implausible model_prob {model_prob} ({matchup})")
+                    continue
                 if edge is not None and edge >= min_edge:
                     picks.append({
                         "matchup": matchup,
                         "type": "Spread",
                         "side": side_label,
-                        "line_label": f'{side_label} {point:+}',
+                        "line_label": f'{side_label} {line_point:+}',
                         "model_prob": model_prob,
                         "market_prob": market_prob,
                         "model_decimal": prob_to_decimal_odds(model_prob),
@@ -2136,6 +2151,15 @@ def extract_top_picks(report, min_edge=MIN_EDGE_POINTS, limit=TOP_PICKS_LIMIT):
                 market_prob = market_entry.get(market_prob_key)
                 market_decimal = market_entry.get(market_dec_key)
                 edge = calc_edge(model_prob, market_prob)
+                # Same sanity backstop as spreads: real MLB totals run
+                # roughly 6-13, and a legitimate total-line probability
+                # shouldn't saturate near-certain either.
+                if not (6 <= line <= 13):
+                    print(f"BUG SIGNAL: skipping total pick with implausible line {line} ({matchup})")
+                    continue
+                if model_prob >= 0.97 or model_prob <= 0.03:
+                    print(f"BUG SIGNAL: skipping total pick with implausible model_prob {model_prob} ({matchup})")
+                    continue
                 if edge is not None and edge >= min_edge:
                     picks.append({
                         "matchup": matchup,
@@ -2555,8 +2579,6 @@ h1 {{
 <body>
 <h1>MLB Daily Probabilities</h1>
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
-<p class="disclaimer">These are estimates, not guarantees — always double-check the actual odds at your sportsbook before betting. Numbers are directional (best-effort predictions), not scientifically proven locks.</p>
-
 {top_picks_html}
 
 <h2 class="section-divider">All games: spread &amp; total detail</h2>
