@@ -2076,7 +2076,7 @@ def build_report():
         # negation of the home-team point on the market board) - same
         # reasoning as the totals fix above: edge detection needs a model
         # number at the SAME point the market is offering.
-        spread_points_to_test = {-1.5, 1.5, 2.5}
+        spread_points_to_test = {-4.5, -3.5, -2.5, -1.5, 1.5, 2.5, 3.5, 4.5}
         for market_spread in entry.get("market", {}).get("spreads", []):
             spread_points_to_test.add(-market_spread["point"])  # away-perspective point
         for spread in sorted(spread_points_to_test):
@@ -2229,40 +2229,43 @@ def _render_empty_state():
     </div>"""
 
 
-MIN_CONFIDENCE_POINTS = 5.0   # minimum model confidence above a coinflip (percentage points) to surface a pick
-TOP_PICKS_LIMIT = 20          # cap on total picks shown, not games
+# A pick has to be a real lean, not a coinflip with a label on it. 60%
+# means the model thinks this side is meaningfully more likely than not -
+# below that it's noise, not a bet.
+MIN_PICK_PROB = 0.60
+TOP_PICKS_LIMIT = 40  # cap on games shown (up to 2 picks/game: 1 spread + 1 total)
 
 
-def extract_top_picks(report, min_confidence=MIN_CONFIDENCE_POINTS, limit=TOP_PICKS_LIMIT):
+def extract_top_picks(report, min_prob=MIN_PICK_PROB, limit=TOP_PICKS_LIMIT):
     """
-    Scans every game for spread and total lines where the model has a
-    real probability, and keeps the ones where the model's own
-    confidence sits at least `min_confidence` percentage points away
-    from a coinflip (50%). This is the model's own fair-value read,
-    nothing else - it does NOT compare against any sportsbook's price.
+    For each game, picks AT MOST ONE spread line and AT MOST ONE total
+    side - not every point tested, not both sides of the same line.
 
-    Market-line comparison was removed on purpose: this script fetched
-    odds from one specific book (DraftKings via The Odds API's free
-    tier), which most people using this report don't actually bet at -
-    a "model vs. market" edge computed against a book you don't use
-    isn't something you can act on, and it made every MLB run-line quirk
-    (see SPREAD_MAX_DECIMAL) look like a bug rather than the book's
-    honest wide-run-line pricing. Simpler and more honest: this shows
-    ONLY the model's own probability and fair decimal odds. Open your
-    own book and compare its actual price against what's shown here
-    yourself.
+    Spread: across every point tested (+/-1.5, +/-2.5, +/-3.5, etc.) and
+    both teams, keep only the single (team, point) combination with the
+    HIGHEST model cover probability for this game. That's "the best bet
+    on this game's spread," not a list of every number the model
+    produced - showing both sides of the same line is the same
+    information twice, not two picks, and a team's cover probability
+    UNDER 50% is the model saying that side is bad, never a pick.
 
-    No player props, no bet builders, no moneyline/YRFI here - spread
-    and total only, same scope as before.
+    Total: same idea - keep only whichever side (Over or Under) has the
+    higher probability, at the model's own generated lines.
+
+    If neither the best spread nor the best total for a game clears
+    min_prob, that half (or the whole game) is simply left out - no
+    row, no placeholder, no explanation needed. A model that isn't
+    confident about a game just doesn't produce output for it.
     """
     picks = []
 
     for g in report:
         matchup = f'{g["away_team"]} @ {g["home_team"]}'
 
-        # --- spread ---
+        # --- spread: find the single best (team, point) for this game ---
+        best_spread = None
         for s in g.get("spread_lines", []):
-            away_point = s["spread"]  # s["spread"] is always the AWAY team's perspective point
+            away_point = s["spread"]
             home_point = -away_point
             for side_label, model_prob, line_point in (
                 (g["home_team"], s.get("home_cover_prob"), home_point),
@@ -2270,74 +2273,60 @@ def extract_top_picks(report, min_confidence=MIN_CONFIDENCE_POINTS, limit=TOP_PI
             ):
                 if model_prob is None:
                     continue
-                # Sanity backstop: a real MLB run-line point is
-                # essentially always within +/-3.5, and a model
-                # probability pinned at the extreme (>=97% or <=3%) on a
-                # single-game spread almost always means a bad/missing
-                # input upstream rather than genuine certainty.
-                if abs(line_point) > 3.5:
-                    print(f"BUG SIGNAL: skipping spread pick with implausible point {line_point} ({matchup})")
+                if abs(line_point) > 4.5:
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
-                    print(f"BUG SIGNAL: skipping spread pick with implausible model_prob {model_prob} ({matchup})")
                     continue
-                confidence = abs(model_prob - 0.5) * 100
-                if confidence >= min_confidence:
-                    picks.append({
+                if best_spread is None or model_prob > best_spread["model_prob"]:
+                    best_spread = {
                         "matchup": matchup,
                         "type": "Spread",
                         "side": side_label,
                         "line_label": f'{side_label} {line_point:+}',
                         "model_prob": model_prob,
                         "model_decimal": prob_to_decimal_odds(model_prob),
-                        "confidence_points": round(confidence, 1),
-                    })
+                    }
+        if best_spread and best_spread["model_prob"] >= min_prob:
+            picks.append(best_spread)
 
-        # --- total ---
+        # --- total: find the single best side for this game ---
+        best_total = None
         for tr in g.get("total_runs", []):
             line = tr.get("line")
+            if not (6 <= line <= 13):
+                continue
             for side_label, model_prob in (
                 ("Over", tr.get("over_prob")),
                 ("Under", tr.get("under_prob")),
             ):
                 if model_prob is None:
                     continue
-                if not (6 <= line <= 13):
-                    print(f"BUG SIGNAL: skipping total pick with implausible line {line} ({matchup})")
-                    continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
-                    print(f"BUG SIGNAL: skipping total pick with implausible model_prob {model_prob} ({matchup})")
                     continue
-                confidence = abs(model_prob - 0.5) * 100
-                if confidence >= min_confidence:
-                    picks.append({
+                if best_total is None or model_prob > best_total["model_prob"]:
+                    best_total = {
                         "matchup": matchup,
                         "type": "Total",
                         "side": side_label,
                         "line_label": f'{side_label} {line}',
                         "model_prob": model_prob,
                         "model_decimal": prob_to_decimal_odds(model_prob),
-                        "confidence_points": round(confidence, 1),
-                    })
+                    }
+        if best_total and best_total["model_prob"] >= min_prob:
+            picks.append(best_total)
 
-    picks.sort(key=lambda x: x["confidence_points"], reverse=True)
+    picks.sort(key=lambda x: x["model_prob"], reverse=True)
     return picks[:limit]
 
 
 
 def _render_top_picks(picks):
-    """
-    Renders the picks section: every entry here is purely the model's own
-    read - a fair probability and the decimal odds implied by it, ranked
-    by how far from a coinflip (50%) the model's confidence sits. No
-    sportsbook price is fetched or compared here; open your own book and
-    compare its actual line against what's shown.
-    """
+    """Renders the picks section: one best spread and one best total per game, model probability only."""
     if not picks:
         return """
     <section class="top-picks">
       <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">No spread or total today cleared the minimum model confidence threshold. That's a normal, honest outcome - it means the model itself doesn't see a strong lean either way today. No picks is a valid result, not a bug.</p>
+      <p class="top-picks-sub">No games today.</p>
     </section>"""
 
     rows = []
@@ -2352,9 +2341,8 @@ def _render_top_picks(picks):
         <p class="pick-line">{pk["line_label"]}</p>
         <div class="odds-compare">
           <div class="odds-col">
-            <span class="odds-col-label">model fair odds</span>
+            <span class="odds-col-label">fair odds</span>
             <span class="odds-col-value">{pk["model_decimal"]}</span>
-            <span class="odds-col-sub">{pk["model_prob"]*100:.1f}%</span>
           </div>
         </div>
       </div>""")
@@ -2362,7 +2350,6 @@ def _render_top_picks(picks):
     return f"""
     <section class="top-picks">
       <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">Model's own fair probability and implied decimal odds, ranked by confidence. No sportsbook price is used here - compare against whatever book you actually have open.</p>
       <div class="pick-grid">
         {''.join(rows)}
       </div>
