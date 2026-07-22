@@ -30,6 +30,8 @@ jobs:
 
       - name: Run prediction script
         run: python predict.py
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
