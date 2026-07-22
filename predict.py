@@ -123,6 +123,15 @@ def team_nickname(team_id, fallback_name=None):
 # The key is read from the ODDS_API_KEY environment variable - set it as a
 # GitHub Actions repo secret (Settings -> Secrets and variables -> Actions),
 # never hardcode it here.
+#
+# BOOKMAKER CHOICE: fixed to a single book (DraftKings) rather than
+# averaging across every US book The Odds API returns. Sportsbet.io isn't
+# covered by The Odds API on any tier, and Pinnacle requires a paid
+# Business-tier plan - DraftKings is the closest free-tier stand-in: a
+# large, liquid, mainstream US book. Every price shown is now literally
+# "what DraftKings has posted," never a multi-book blend - no averaging
+# needed, and no risk of one thin/stale book skewing a "consensus" number.
+ODDS_BOOKMAKER_KEY = "draftkings"
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
@@ -131,16 +140,19 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 def get_mlb_odds():
     """
     Fetches today's MLB odds board (moneyline, spreads, totals) from The
-    Odds API, one call for the whole slate. Returns the raw list of event
-    objects, or None if the key is missing or the call fails - callers
-    must treat None as "no market data available today" and say so
-    honestly rather than silently falling back to model-only numbers
+    Odds API, filtered to a single bookmaker (ODDS_BOOKMAKER_KEY) so every
+    price is attributable to one real, specific board rather than a
+    multi-book blend. One call for the whole slate. Returns the raw list
+    of event objects, or None if the key is missing or the call fails -
+    callers must treat None as "no market data available today" and say
+    so honestly rather than silently falling back to model-only numbers
     labeled as if they were market-checked.
     """
     if not ODDS_API_KEY:
         return None
     url = (f"{ODDS_API_BASE}/sports/baseball_mlb/odds"
            f"?regions=us&markets=h2h,spreads,totals&oddsFormat=decimal"
+           f"&bookmakers={ODDS_BOOKMAKER_KEY}"
            f"&apiKey={ODDS_API_KEY}")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -166,14 +178,29 @@ def _remove_vig_two_way(decimal_odds_a, decimal_odds_b):
     return raw_a / overround, raw_b / overround
 
 
-def _average_book_prices(bookmakers, market_key, point=None):
+def _book_price(bookmakers, market_key, point=None, max_decimal=None):
     """
-    Averages decimal price for each outcome across all books offering
-    market_key (and matching `point` for spreads/totals). Returns
-    {outcome_name: avg_decimal_price}.
+    Pulls the decimal price for each outcome from the (single, filtered-
+    to-ODDS_BOOKMAKER_KEY) bookmaker list, matching market_key and `point`
+    for spreads/totals. Returns {outcome_name: decimal_price}.
+
+    `bookmakers` normally contains exactly one book now (the API call is
+    filtered to ODDS_BOOKMAKER_KEY), so this is usually just "the one
+    price that book posted" rather than an average. Still guards against
+    a single bad/stale quote from that book:
+
+    max_decimal: an absolute ceiling appropriate to the market type
+    (spreads/totals are close-to-a-coinflip bets; a real book price here
+    is essentially never above ~6.0-7.0 decimal). A quote above this is
+    dropped rather than trusted at face value - this can happen if a
+    book's board glitches or hasn't refreshed.
+
+    If the API response ever includes more than one book (e.g. the
+    named book didn't post lines for a game and another leaked through),
+    multiple quotes for the same outcome are averaged with median-based
+    outlier rejection so one bad quote still can't dominate.
     """
-    sums = {}
-    counts = {}
+    raw = {}
     for bm in bookmakers:
         for market in bm.get("markets", []):
             if market.get("key") != market_key:
@@ -183,31 +210,52 @@ def _average_book_prices(bookmakers, market_key, point=None):
                     continue
                 name = outcome.get("name")
                 price = outcome.get("price")
-                if name is None or price is None:
+                if name is None or price is None or price <= 1:
                     continue
-                sums[name] = sums.get(name, 0) + price
-                counts[name] = counts.get(name, 0) + 1
-    return {name: sums[name] / counts[name] for name in sums}
+                if max_decimal is not None and price > max_decimal:
+                    continue
+                raw.setdefault(name, []).append(price)
+
+    result = {}
+    for name, prices in raw.items():
+        if len(prices) >= 3:
+            med = statistics.median(prices)
+            filtered = [p for p in prices if med / 3 <= p <= med * 3]
+            if filtered:
+                prices = filtered
+        result[name] = sum(prices) / len(prices)
+    return result
+
+
+# A spread or total is close to a coinflip by construction (that's the
+# point of the book setting the line where it does) - real de-vigged
+# prices on these markets essentially never exceed ~6.0-7.0 decimal
+# (roughly <15%). Anything beyond that on a spread/total quote is a
+# bad data point, not a real long-shot price like you'd see on a
+# moneyline. Used as the max_decimal ceiling for spreads/totals only.
+SPREAD_TOTAL_MAX_DECIMAL = 7.0
 
 
 def get_market_lines_for_event(event, home_team, away_team):
     """
-    Pulls fair (de-vigged), book-averaged probabilities for h2h, spreads,
-    and totals out of one Odds API event object. Any market a book didn't
-    post today is simply absent, never guessed at.
+    Pulls fair (de-vigged) probabilities for h2h, spreads, and totals out
+    of one Odds API event object, sourced from a single named book
+    (ODDS_BOOKMAKER_KEY - see get_mlb_odds). Any market that book didn't
+    post today is simply absent, never guessed at and never filled in
+    from a different book.
     """
     bookmakers = event.get("bookmakers", [])
     if not bookmakers:
         return {}
     result = {}
 
-    h2h_avg = _average_book_prices(bookmakers, "h2h")
-    if home_team in h2h_avg and away_team in h2h_avg:
-        home_prob, away_prob = _remove_vig_two_way(h2h_avg[home_team], h2h_avg[away_team])
+    h2h_price = _book_price(bookmakers, "h2h")
+    if home_team in h2h_price and away_team in h2h_price:
+        home_prob, away_prob = _remove_vig_two_way(h2h_price[home_team], h2h_price[away_team])
         if home_prob is not None:
             result["h2h"] = {
                 "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
-                "home_decimal": round(h2h_avg[home_team], 3), "away_decimal": round(h2h_avg[away_team], 3),
+                "home_decimal": round(h2h_price[home_team], 3), "away_decimal": round(h2h_price[away_team], 3),
             }
 
     spread_points = set()
@@ -219,14 +267,14 @@ def get_market_lines_for_event(event, home_team, away_team):
                         spread_points.add(outcome["point"])
     spreads_out = []
     for point in sorted(spread_points):
-        avg = _average_book_prices(bookmakers, "spreads", point=point)
-        avg_away = _average_book_prices(bookmakers, "spreads", point=-point)
-        if home_team in avg and away_team in avg_away:
-            home_prob, away_prob = _remove_vig_two_way(avg[home_team], avg_away[away_team])
+        home_price = _book_price(bookmakers, "spreads", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
+        away_price = _book_price(bookmakers, "spreads", point=-point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
+        if home_team in home_price and away_team in away_price:
+            home_prob, away_prob = _remove_vig_two_way(home_price[home_team], away_price[away_team])
             if home_prob is not None:
                 spreads_out.append({
                     "point": point, "home_prob": round(home_prob, 4), "away_prob": round(away_prob, 4),
-                    "home_decimal": round(avg[home_team], 3), "away_decimal": round(avg_away[away_team], 3),
+                    "home_decimal": round(home_price[home_team], 3), "away_decimal": round(away_price[away_team], 3),
                 })
     if spreads_out:
         result["spreads"] = spreads_out
@@ -240,13 +288,13 @@ def get_market_lines_for_event(event, home_team, away_team):
                         total_points.add(outcome["point"])
     totals_out = []
     for point in sorted(total_points):
-        avg = _average_book_prices(bookmakers, "totals", point=point)
-        if "Over" in avg and "Under" in avg:
-            over_prob, under_prob = _remove_vig_two_way(avg["Over"], avg["Under"])
+        price = _book_price(bookmakers, "totals", point=point, max_decimal=SPREAD_TOTAL_MAX_DECIMAL)
+        if "Over" in price and "Under" in price:
+            over_prob, under_prob = _remove_vig_two_way(price["Over"], price["Under"])
             if over_prob is not None:
                 totals_out.append({
                     "point": point, "over_prob": round(over_prob, 4), "under_prob": round(under_prob, 4),
-                    "over_decimal": round(avg["Over"], 3), "under_decimal": round(avg["Under"], 3),
+                    "over_decimal": round(price["Over"], 3), "under_decimal": round(price["Under"], 3),
                 })
     if totals_out:
         result["totals"] = totals_out
