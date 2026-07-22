@@ -2233,123 +2233,119 @@ def _render_empty_state():
 # means the model thinks this side is meaningfully more likely than not -
 # below that it's noise, not a bet.
 MIN_PICK_PROB = 0.60
-TOP_PICKS_LIMIT = 40  # cap on games shown (up to 2 picks/game: 1 spread + 1 total)
+BET_BUILDER_MIN_PROB = 0.40
+TOP_PICKS_LIMIT = 40
 
 
 def extract_top_picks(report, min_prob=MIN_PICK_PROB, limit=TOP_PICKS_LIMIT):
+    """Build one same-game bet builder per qualifying game.
+
+    A qualifying builder must contain BOTH:
+      1) the single highest-confidence spread side for the game, and
+      2) the single highest-confidence total side for the game.
+
+    The two model probabilities are multiplied as a simple independence
+    approximation. This is intentionally conservative about presentation:
+    if either leg is missing or below the minimum confidence threshold, the
+    entire game is skipped rather than showing a partial bet.
     """
-    For each game, picks AT MOST ONE spread line and AT MOST ONE total
-    side - not every point tested, not both sides of the same line.
-
-    Spread: across every point tested (+/-1.5, +/-2.5, +/-3.5, etc.) and
-    both teams, keep only the single (team, point) combination with the
-    HIGHEST model cover probability for this game. That's "the best bet
-    on this game's spread," not a list of every number the model
-    produced - showing both sides of the same line is the same
-    information twice, not two picks, and a team's cover probability
-    UNDER 50% is the model saying that side is bad, never a pick.
-
-    Total: same idea - keep only whichever side (Over or Under) has the
-    higher probability, at the model's own generated lines.
-
-    If neither the best spread nor the best total for a game clears
-    min_prob, that half (or the whole game) is simply left out - no
-    row, no placeholder, no explanation needed. A model that isn't
-    confident about a game just doesn't produce output for it.
-    """
-    picks = []
+    builders = []
 
     for g in report:
         matchup = f'{g["away_team"]} @ {g["home_team"]}'
 
-        # --- spread: find the single best (team, point) for this game ---
+        # Best spread side. Keep the existing sensible +/-4.5 boundary, but
+        # never surface the old spread bars or every tested line.
         best_spread = None
         for s in g.get("spread_lines", []):
-            away_point = s["spread"]
+            away_point = s.get("spread")
+            if away_point is None:
+                continue
             home_point = -away_point
             for side_label, model_prob, line_point in (
-                (g["home_team"], s.get("home_cover_prob"), home_point),
                 (g["away_team"], s.get("away_cover_prob"), away_point),
+                (g["home_team"], s.get("home_cover_prob"), home_point),
             ):
-                if model_prob is None:
-                    continue
-                if abs(line_point) > 4.5:
+                if model_prob is None or abs(line_point) > 4.5:
                     continue
                 if model_prob >= 0.97 or model_prob <= 0.03:
                     continue
                 if best_spread is None or model_prob > best_spread["model_prob"]:
                     best_spread = {
-                        "matchup": matchup,
-                        "type": "Spread",
                         "side": side_label,
                         "line_label": f'{side_label} {line_point:+}',
                         "model_prob": model_prob,
-                        "model_decimal": prob_to_decimal_odds(model_prob),
                     }
-        if best_spread and best_spread["model_prob"] >= min_prob:
-            picks.append(best_spread)
 
-        # --- total: find the single best side for this game ---
+        # Best total side.
         best_total = None
         for tr in g.get("total_runs", []):
             line = tr.get("line")
-            if not (6 <= line <= 13):
+            if line is None or not (6 <= line <= 13):
                 continue
             for side_label, model_prob in (
                 ("Over", tr.get("over_prob")),
                 ("Under", tr.get("under_prob")),
             ):
-                if model_prob is None:
-                    continue
-                if model_prob >= 0.97 or model_prob <= 0.03:
+                if model_prob is None or model_prob >= 0.97 or model_prob <= 0.03:
                     continue
                 if best_total is None or model_prob > best_total["model_prob"]:
                     best_total = {
-                        "matchup": matchup,
-                        "type": "Total",
                         "side": side_label,
                         "line_label": f'{side_label} {line}',
                         "model_prob": model_prob,
-                        "model_decimal": prob_to_decimal_odds(model_prob),
                     }
-        if best_total and best_total["model_prob"] >= min_prob:
-            picks.append(best_total)
 
-    picks.sort(key=lambda x: x["model_prob"], reverse=True)
-    return picks[:limit]
+        # A builder requires both legs. Skip the game completely otherwise.
+        if not best_spread or not best_total:
+            continue
+        if best_spread["model_prob"] < min_prob or best_total["model_prob"] < min_prob:
+            continue
+
+        combined_prob = best_spread["model_prob"] * best_total["model_prob"]
+        if combined_prob < BET_BUILDER_MIN_PROB:
+            continue
+
+        builders.append({
+            "matchup": matchup,
+            "spread": best_spread,
+            "total": best_total,
+            "model_prob": round(combined_prob, 3),
+            "model_decimal": prob_to_decimal_odds(combined_prob),
+        })
+
+    builders.sort(key=lambda x: x["model_prob"], reverse=True)
+    return builders[:limit]
 
 
-
-def _render_top_picks(picks):
-    """Renders the picks section: one best spread and one best total per game, model probability only."""
-    if not picks:
-        return """
-    <section class="top-picks">
-      <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">No games today.</p>
-    </section>"""
+def _render_top_picks(builders):
+    """Render only same-game spread + total bet builders."""
+    if not builders:
+        return ""
 
     rows = []
-    for pk in picks:
+    for b in builders:
         rows.append(f"""
       <div class="pick-card">
         <div class="pick-card-top">
-          <span class="pick-type">{pk["type"]}</span>
-          <span class="pick-prob">{pk["model_prob"]*100:.1f}%</span>
+          <span class="pick-type">same-game bet builder</span>
+          <span class="pick-prob">{b["model_prob"]*100:.1f}%</span>
         </div>
-        <p class="pick-player">{pk["matchup"]}</p>
-        <p class="pick-line">{pk["line_label"]}</p>
+        <p class="pick-player">{b["matchup"]}</p>
+        <p class="pick-line">{b["spread"]["line_label"]}</p>
+        <p class="pick-line">{b["total"]["line_label"]}</p>
         <div class="odds-compare">
           <div class="odds-col">
-            <span class="odds-col-label">fair odds</span>
-            <span class="odds-col-value">{pk["model_decimal"]}</span>
+            <span class="odds-col-label">combined fair odds</span>
+            <span class="odds-col-value">{b["model_decimal"]}</span>
           </div>
         </div>
       </div>""")
 
     return f"""
     <section class="top-picks">
-      <h2 class="top-picks-title">today's picks</h2>
+      <h2 class="top-picks-title">bet builders</h2>
+      <p class="top-picks-sub">Each builder combines the model's best spread side and best total side from the same game. Combined probability uses a simple independence approximation.</p>
       <div class="pick-grid">
         {''.join(rows)}
       </div>
@@ -2357,8 +2353,8 @@ def _render_top_picks(picks):
 
 
 def render_html(report):
-    top_picks = extract_top_picks(report)
-    top_picks_html = _render_top_picks(top_picks)
+    bet_builders = extract_top_picks(report)
+    top_picks_html = _render_top_picks(bet_builders)
     cards = []
     for g in report:
         block = []
@@ -2369,28 +2365,6 @@ def render_html(report):
         if g.get("park_description"):
             block.append(f'<p class="rest-line">{g["park_description"]}</p>')
         block.append('</div>')
-
-        block.append('<h3 class="section-label">Spread Cover</h3>')
-        block.append('<div class="spread-block">')
-        for s in g["spread_lines"]:
-            block.append('<div class="spread-row-group">')
-            block.append(f'<span class="spread-num">{s["spread"]:+}</span>')
-            block.append(_prob_bar(g["away_team"], s["away_cover_prob"], "var(--teal)"))
-            block.append(_prob_bar(g["home_team"], s["home_cover_prob"], "var(--orange)"))
-            block.append('</div>')
-        block.append('</div>')
-
-        total_runs = g.get("total_runs") or []
-        if total_runs:
-            block.append('<h3 class="section-label">Total Runs (Over/Under)</h3>')
-            block.append('<div class="spread-block">')
-            for tr in total_runs:
-                block.append('<div class="spread-row-group">')
-                block.append(f'<span class="spread-num">{tr["line"]}</span>')
-                block.append(_prob_bar(f'Over {tr["line"]}', tr["over_prob"], "var(--teal)"))
-                block.append(_prob_bar(f'Under {tr["line"]}', tr["under_prob"], "var(--orange)"))
-                block.append('</div>')
-            block.append('</div>')
 
         block.append('<ul class="why-list">')
         for label, recent, bullpen, form in (
@@ -2705,7 +2679,6 @@ h1 {{
 <p class="updated">Generated {datetime.utcnow().strftime('%d %b %y %H:%M UTC')}</p>
 {top_picks_html}
 
-<h2 class="section-divider">All games: spread &amp; total detail</h2>
 {_render_empty_state() if not cards else ''.join(cards)}
 
 </body>
