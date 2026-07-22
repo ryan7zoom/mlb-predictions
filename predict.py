@@ -2224,7 +2224,6 @@ def _render_top_picks(picks, market_data_available):
     return f"""
     <section class="top-picks">
       <h2 class="top-picks-title">today's picks</h2>
-      <p class="top-picks-sub">Spread and total only. Every pick below has a real sportsbook price (averaged across books, de-vigged) behind it, and the model's probability beats that market price by at least {MIN_EDGE_POINTS:.0f} points. Model decimal odds are what the model's probability implies; market decimal odds are what the book is actually offering - bet at the book's price, this is a comparison, not a guarantee.</p>
       <div class="pick-grid">
         {''.join(rows)}
       </div>
